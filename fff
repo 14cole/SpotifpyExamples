@@ -1,0 +1,1996 @@
+import shutil
+import tempfile
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
+from materials_solver import (
+    DebyeControls,
+    DoubleLorentzControls,
+    compute_debye_ceps,
+    compute_debye_lorentz_ceps,
+    fit_debye,
+    fit_double_lorentz,
+    generate_dbe_report,
+    generate_dlm_report,
+    read_material_file,
+)
+
+
+def _extract_parameter_mapping(path: Path, marker: str) -> Optional[Dict[str, str]]:
+    """Returns a header/value mapping for the block identified by marker."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return None
+    for idx, line in enumerate(lines):
+        if marker in line:
+            if idx + 2 >= len(lines):
+                return None
+            header_tokens = [token.upper() for token in lines[idx + 1].split()]
+            data_tokens = lines[idx + 2].split()
+            if len(data_tokens) < len(header_tokens):
+                return None
+            return dict(zip(header_tokens, data_tokens))
+    return None
+
+
+def parse_dbe_file(path: Path) -> Optional[Dict[str, str]]:
+    marker = "LEAST SQUARE FIT TO DEBYE PARAMETERS:"
+    return _extract_parameter_mapping(path, marker)
+
+
+def parse_2lm_file(path: Path) -> Optional[Dict[str, str]]:
+    markers = (
+        "LEAST SQUARE FIT TO DOUBLE LORENTZIAN PARAMETERS:",
+        "LEAST SQUARE FIT TO DEBYE-LORENTZIAN PARAMETERS:",
+    )
+    for marker in markers:
+        parsed = _extract_parameter_mapping(path, marker)
+        if parsed:
+            return parsed
+    return None
+
+
+@dataclass(frozen=True)
+class TabConfig:
+    key: str
+    notebook_label: str
+    file_extension: str
+    parser: Callable[[Path], Optional[Dict[str, str]]]
+    value_headers: Tuple[str, ...]
+    small_headers: Tuple[str, ...]
+    plot_color: str
+    polynomial_headers: Tuple[str, ...]
+    ini_mapping: Dict[str, Any]
+    value_aliases: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+
+    @property
+    def stem_header(self) -> str:
+        return f"STEM OF THE {self.file_extension.upper()} FILE"
+
+    @property
+    def large_headers(self) -> Tuple[str, ...]:
+        return ("ALPHA",) + self.value_headers + (self.stem_header,)
+
+
+@dataclass
+class ColumnSelection:
+    tab_key: str
+    header: str
+    large_index: int
+
+
+@dataclass
+class TabState:
+    config: TabConfig
+    frame: ttk.Frame
+    figure: Figure
+    canvas: FigureCanvasTkAgg
+    axes: Any
+    large_tree: ttk.Treeview
+    small_tree: ttk.Treeview
+    summary_label: ttk.Label
+    summary_tree: ttk.Treeview
+    small_rows: Dict[str, str]
+    column_index: Dict[str, int]
+    large_overlays: List[tk.Widget]
+    small_overlays: List[tk.Widget]
+    ini_label_var: tk.StringVar
+    ini_tree: ttk.Treeview
+
+
+@dataclass
+class ParameterBlock:
+    path: Path
+    headers: List[str]
+    values: List[str]
+    header_index: int
+    value_index: int
+    lines: List[str]
+
+
+@dataclass
+class ParameterEditorRow:
+    header: str
+    mode_var: tk.StringVar
+    value_entry: ttk.Entry
+    original_value: str
+    preview_label: ttk.Label
+
+
+TAB_CONFIGS: Tuple[TabConfig, ...] = (
+    TabConfig(
+        key="EPS",
+        notebook_label="EPS_DEBYE",
+        file_extension=".DBE",
+        parser=parse_dbe_file,
+        value_headers=("FRES", "DEPS", "EPSV", "GAMMA", "SIGE", "RMS"),
+        small_headers=("FRES", "DEPS", "EPSV", "GAMMA", "SIGE"),
+        plot_color="#d9534f",
+        polynomial_headers=("FRES", "DEPS", "EPSV", "GAMMA", "SIGE"),
+        ini_mapping={
+            "FRES": "FRES0",
+            "DEPS": "DEPS0",
+            "EPSV": "EPSV0",
+            "GAMMA": "GAMM0",
+            "SIGE": "SIGE0",
+        },
+    ),
+    TabConfig(
+        key="MUS",
+        notebook_label="MUS_DL",
+        file_extension=".2LM",
+        parser=parse_2lm_file,
+        value_headers=("FR_M1", "DMUR1", "GAMM1", "FR_M2", "DMUR2",
+                       "GAMM2", "MURV", "SIGM", "RMS"),
+        small_headers=("FR_M1", "DMUR1", "GAMM1", "FR_M2", "DMUR2",
+                       "GAMM2", "MURV", "SIGM"),
+        plot_color="#0275d8",
+        polynomial_headers=("FR_M1", "DMUR1", "GAMM1", "FR_M2", "DMUR2",
+                            "GAMM2", "MURV", "SIGM"),
+        ini_mapping={
+            "FR_M1": "FR_M01",
+            "DMUR1": "DMUR01",
+            "GAMM1": "GAMM01",
+            "FR_M2": "FR_M02",
+            "DMUR2": "DMUR02",
+            "GAMM2": "GAMM02",
+            "MURV": "MURV0",
+            "SIGM": "SIGM0",
+        },
+    ),
+)
+
+
+class MaterialGui:
+    CONTROL_OPTIONS = (
+        ("estimate", "Let computer estimate (0)"),
+        ("fix", "Keep parameter fixed (>0)"),
+        ("negative", "Use negative initial guess (<0)"),
+    )
+
+    def __init__(self) -> None:
+        self.root = tk.Tk()
+        self.root.title("Material Parameter Viewer")
+        self.root.geometry("1100x650")
+        self.status_var = tk.StringVar(value="No file loaded.")
+        self.tabs: Dict[str, TabState] = {}
+        self.selection: Optional[ColumnSelection] = None
+        self.loaded_alpha_pairs: List[Tuple[str, str]] = []
+        self.loaded_base_path: Optional[Path] = None
+        self.loaded_lst_name: Optional[str] = None
+        self.loaded_lst_path: Optional[Path] = None
+        self.alpha0: Optional[float] = None
+        self.idbkode: Optional[int] = None
+        self.tab_extensions: Dict[str, Optional[str]] = {"EPS": ".DBE", "MUS": ".2LM"}
+        self.lsf_data: Dict[str, Dict[str, Dict[str, str]]] = {"EPS": {}, "MUS": {}}
+        self.loaded_lsf_path: Optional[Path] = None
+        self.alpha_to_files: Dict[str, Dict[str, str]] = {"EPS": {}, "MUS": {}}
+        self.alpha_to_stem: Dict[str, str] = {}
+        self.polynomial_models: Dict[str, Dict[str, Dict[str, Any]]] = {"EPS": {}, "MUS": {}}
+        self.parameter_blocks: Dict[str, Dict[str, ParameterBlock]] = {"EPS": {}, "MUS": {}}
+        self.alpha_file_paths: Dict[str, Dict[str, Path]] = {"EPS": {}, "MUS": {}}
+        self.ini_inline_widgets: Dict[str, Optional[tk.Widget]] = {"EPS": None, "MUS": None}
+        self.loaded_lsf_path: Optional[Path] = None
+        self.lsf_data: Dict[str, Dict[str, Dict[str, str]]] = {"EPS": {}, "MUS": {}}
+        self.snapshot_dir: Optional[Path] = None
+        self.snapshot_map: Dict[Path, Path] = {}
+        self.diagnostics_listbox: Optional[tk.Listbox] = None
+        self.diagnostics_quantity_var: Optional[tk.StringVar] = None
+        self.diagnostics_status_var: Optional[tk.StringVar] = None
+        self.diagnostics_axes_real = None
+        self.diagnostics_axes_imag = None
+        self.diagnostics_canvas: Optional[FigureCanvasTkAgg] = None
+        self._build_style()
+        self._build_header()
+        self._build_notebook()
+
+    def _build_style(self) -> None:
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("default")
+        except tk.TclError:
+            pass
+        style.configure("Status.TLabel", anchor="w")
+        base_bg = style.lookup("Treeview", "background") or "#ffffff"
+        base_fg = style.lookup("Treeview", "foreground") or "#000000"
+        style.map(
+            "Treeview",
+            background=[("selected", base_bg)],
+            foreground=[("selected", base_fg)],
+        )
+
+    def _build_header(self) -> None:
+        header = ttk.Frame(self.root)
+        header.pack(fill="x", padx=10, pady=5)
+        ttk.Button(header, text="Load .LST File", command=self.load_lst_file).pack(side=tk.LEFT)
+        ttk.Button(header, text="Edit .LST", command=self.open_lst_editor).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(header, text="Generate Initial Fits", command=self.generate_initial_fits).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(header, text="Generate IDB", command=self.generate_idb_file).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(header, text="Restore Originals", command=self.restore_original_files).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(header, textvariable=self.status_var, style="Status.TLabel").pack(side=tk.LEFT, padx=12)
+
+    def _build_notebook(self) -> None:
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True)
+        for config in TAB_CONFIGS:
+            frame = ttk.Frame(notebook)
+            notebook.add(frame, text=config.notebook_label)
+            state = self._build_tab(frame, config)
+            self.tabs[config.key] = state
+        self._build_diagnostics_tab(notebook)
+
+    def _build_tab(self, container: ttk.Frame, config: TabConfig) -> TabState:
+        outer = ttk.Panedwindow(container, orient=tk.VERTICAL)
+        outer.pack(fill="both", expand=True, padx=5, pady=5)
+
+        top_split = ttk.Panedwindow(outer, orient=tk.HORIZONTAL)
+        bottom_split = ttk.Panedwindow(outer, orient=tk.HORIZONTAL)
+        outer.add(top_split, weight=1)
+        outer.add(bottom_split, weight=2)
+
+        # Plot
+        plot_frame = ttk.Frame(top_split)
+        top_split.add(plot_frame, weight=2)
+        figure = Figure(figsize=(4, 3), dpi=100)
+        axes = figure.add_subplot(111)
+        axes.set_title("Select a column to plot")
+        axes.set_xlabel("Alpha")
+        canvas = FigureCanvasTkAgg(figure, master=plot_frame)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # Small table + controls
+        control_frame = ttk.Frame(top_split)
+        top_split.add(control_frame, weight=3)
+        small_columns = ("ROW",) + config.small_headers
+        small_tree = ttk.Treeview(
+            control_frame,
+            columns=small_columns,
+            show="headings",
+            selectmode="browse",
+            height=4,
+        )
+        for column in small_columns:
+            heading = "" if column == "ROW" else column
+            anchor = "center"
+            small_tree.heading(column, text=heading)
+            small_tree.column(column, width=90 if column != "ROW" else 60, anchor=anchor, stretch=True)
+        small_tree.pack(fill="both", expand=True, pady=(0, 8))
+        small_rows = {
+            "PWR": small_tree.insert("", "end", values=("PWR",) + ("0",) * len(config.small_headers)),
+            "RMS": small_tree.insert("", "end", values=("RMS",) + ("",) * len(config.small_headers)),
+        }
+        small_tree.bind("<Button-1>", lambda event, key=config.key: self.handle_column_click(event, key))
+
+        button_row = ttk.Frame(control_frame)
+        button_row.pack(fill="x", pady=(0, 4))
+        ttk.Button(
+            button_row,
+            text="Increase PWR",
+            command=lambda key=config.key: self.adjust_power(key, 1),
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            button_row,
+            text="Decrease PWR",
+            command=lambda key=config.key: self.adjust_power(key, -1),
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            button_row,
+            text="Run Fits",
+            command=lambda key=config.key: self.run_tab_fits(key),
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
+        ini_section = ttk.LabelFrame(control_frame, text="INI Parameter Controls")
+        ini_section.pack(fill="both", expand=False, pady=(4, 0))
+        ini_label_var = tk.StringVar(value="Select a column to edit its INI parameters.")
+        ini_label = ttk.Label(ini_section, textvariable=ini_label_var, anchor="w")
+        ini_label.pack(fill="x", padx=4, pady=(4, 2))
+        ini_tree = ttk.Treeview(
+            ini_section,
+            columns=("FILE", "ALPHA", "PARAM", "MODE", "VALUE", "FINAL"),
+            show="headings",
+            selectmode="browse",
+            height=len(config.small_headers) * 2,
+        )
+        ini_tree.heading("FILE", text="File")
+        ini_tree.heading("ALPHA", text="Alpha")
+        ini_tree.heading("PARAM", text="Parameter")
+        ini_tree.heading("MODE", text="Mode")
+        ini_tree.heading("VALUE", text="Magnitude")
+        ini_tree.heading("FINAL", text="Applied")
+        ini_tree.column("FILE", width=140, anchor="w")
+        ini_tree.column("ALPHA", width=80, anchor="center")
+        ini_tree.column("PARAM", width=110, anchor="center")
+        ini_tree.column("MODE", width=160, anchor="center")
+        ini_tree.column("VALUE", width=100, anchor="center")
+        ini_tree.column("FINAL", width=100, anchor="center")
+        ini_tree.pack(fill="both", expand=False, padx=4, pady=(0, 4))
+        ini_tree.bind("<Double-1>", lambda event, key=config.key: self.start_ini_edit(key, event))
+
+        # Large table
+        large_frame = ttk.Frame(bottom_split)
+        bottom_split.add(large_frame, weight=3)
+        large_tree = ttk.Treeview(
+            large_frame,
+            columns=config.large_headers,
+            show="headings",
+            selectmode="browse",
+        )
+        for header in config.large_headers:
+            large_tree.heading(header, text=header)
+            large_tree.column(header, width=120, anchor="center", stretch=True)
+        large_tree.pack(fill="both", expand=True)
+        large_tree.bind("<Button-1>", lambda event, key=config.key: self.handle_column_click(event, key))
+
+        # Summary
+        summary_frame = ttk.Frame(bottom_split)
+        bottom_split.add(summary_frame, weight=2)
+        summary_label = ttk.Label(
+            summary_frame,
+            text='LSF / IDB / Δ VALUES OF "COLUMN" AT SPECIFIED ALPHAS',
+            anchor="center",
+        )
+        summary_label.pack(fill="x")
+        summary_tree = ttk.Treeview(
+            summary_frame,
+            columns=("ALPHA", "LSF", "IDB", "DELTA"),
+            show="headings",
+            height=8,
+        )
+        for column in ("ALPHA", "LSF", "IDB", "DELTA"):
+            summary_tree.heading(column, text=column)
+            summary_tree.column(column, width=110, anchor="center")
+        summary_tree.pack(fill="both", expand=True)
+
+        column_index = {header: idx for idx, header in enumerate(config.large_headers)}
+        return TabState(
+            config=config,
+            frame=container,
+            figure=figure,
+            canvas=canvas,
+            axes=axes,
+            large_tree=large_tree,
+            small_tree=small_tree,
+            summary_label=summary_label,
+            summary_tree=summary_tree,
+            small_rows=small_rows,
+            column_index=column_index,
+            large_overlays=[],
+            small_overlays=[],
+            ini_label_var=ini_label_var,
+            ini_tree=ini_tree,
+        )
+
+    def _build_diagnostics_tab(self, notebook: ttk.Notebook) -> None:
+        frame = ttk.Frame(notebook)
+        notebook.add(frame, text="IDB vs ROP")
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        side_panel = ttk.Frame(frame)
+        side_panel.grid(row=0, column=0, sticky="nsw", padx=8, pady=8)
+        ttk.Label(side_panel, text="Select Alpha:").pack(anchor="w")
+        self.diagnostics_listbox = tk.Listbox(side_panel, height=12, exportselection=False)
+        self.diagnostics_listbox.pack(fill="y", expand=True)
+        self.diagnostics_listbox.bind("<<ListboxSelect>>", lambda _e: self.update_diagnostics_plot())
+        self.diagnostics_quantity_var = tk.StringVar(value="EPS")
+        ttk.Label(side_panel, text="Quantity:").pack(anchor="w", pady=(8, 0))
+        for text, value in (("CEPS", "EPS"), ("CMU", "MUS")):
+            ttk.Radiobutton(
+                side_panel,
+                text=text,
+                value=value,
+                variable=self.diagnostics_quantity_var,
+                command=self.update_diagnostics_plot,
+            ).pack(anchor="w")
+        self.diagnostics_status_var = tk.StringVar(value="Load an LST file to view diagnostics.")
+        ttk.Label(side_panel, textvariable=self.diagnostics_status_var, wraplength=180).pack(fill="x", pady=(8, 0))
+
+        plot_frame = ttk.Frame(frame)
+        plot_frame.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
+        self.diagnostics_figure = Figure(figsize=(5, 4), dpi=100)
+        self.diagnostics_axes_real = self.diagnostics_figure.add_subplot(211)
+        self.diagnostics_axes_imag = self.diagnostics_figure.add_subplot(212)
+        self.diagnostics_axes_real.set_ylabel("Real")
+        self.diagnostics_axes_imag.set_ylabel("Imag")
+        self.diagnostics_axes_imag.set_xlabel("Frequency (GHz)")
+        self.diagnostics_canvas = FigureCanvasTkAgg(self.diagnostics_figure, master=plot_frame)
+        self.diagnostics_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.refresh_diagnostics_alpha_list()
+
+    def set_status(self, message: str) -> None:
+        self.status_var.set(message)
+
+    def load_lst_file(self) -> None:
+        file_path = filedialog.askopenfilename(
+            title="Select LST File",
+            filetypes=[("LST Files", "*.LST"), ("All Files", "*.*")],
+        )
+        if not file_path:
+            self.set_status("No file loaded.")
+            return
+        self._load_lst_from_path(Path(file_path))
+
+    def _load_lst_from_path(self, lst_path: Path) -> None:
+        alpha_pairs, idbkode = self.parse_lst_file(lst_path)
+        if not alpha_pairs:
+            self.set_status(f"{lst_path.name}: no valid entries found.")
+            return
+        self.idbkode = idbkode
+        self.alpha_to_stem = {self.normalize_alpha(alpha): stem for alpha, stem in alpha_pairs}
+        missing = self.populate_tables(alpha_pairs, lst_path.parent)
+        missing_summary = ""
+        if missing:
+            missing_summary = f"; missing {len(missing)} file(s)"
+        self.set_status(f"Loaded {lst_path.name} ({len(alpha_pairs)} alphas){missing_summary}")
+        self.loaded_alpha_pairs = alpha_pairs
+        self.loaded_base_path = lst_path.parent
+        self.loaded_lst_name = lst_path.name
+        self.loaded_lst_path = lst_path
+        alpha_values: List[float] = []
+        for alpha, _ in alpha_pairs:
+            try:
+                alpha_values.append(float(alpha))
+            except (ValueError, TypeError):
+                continue
+        if alpha_values:
+            self.alpha0 = sum(alpha_values) / len(alpha_values)
+        else:
+            self.alpha0 = None
+        self.update_expected_extensions()
+        self.alpha_to_files = {"EPS": {}, "MUS": {}}
+        self.load_lsf_data(lst_path)
+        self.update_plots()
+        self.update_summary_tables()
+        self.update_highlights()
+        self.update_polynomial_models()
+        for key in self.tabs:
+            self.refresh_ini_table(key)
+        self.refresh_diagnostics_alpha_list()
+        self.create_file_snapshot()
+
+    def parse_lst_file(self, path: Path) -> Tuple[List[Tuple[str, str]], Optional[int]]:
+        try:
+            lines = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+        except OSError as exc:
+            self.set_status(f"Unable to read {path.name}: {exc}")
+            return [], None
+        data_lines = [line for line in lines if not line.startswith("!")]
+        if not data_lines:
+            return [], None
+        try:
+            header_tokens = data_lines[0].split()
+            count = int(header_tokens[0])
+            idbk = int(header_tokens[1]) if len(header_tokens) > 1 else None
+        except ValueError:
+            return [], None
+        expected = count * 2
+        entries = data_lines[1:1 + expected]
+        if len(entries) < expected:
+            return [], None
+        pairs: List[Tuple[str, str]] = []
+        for idx in range(count):
+            alpha = entries[2 * idx].split()[0]
+            stem = entries[2 * idx + 1]
+            pairs.append((alpha, stem))
+        return pairs, idbk
+
+    def _write_lst_file(self, alpha_pairs: List[Tuple[str, str]], idbk: Optional[int], path: Path) -> None:
+        lines: List[str] = []
+        header_idbk = idbk if idbk is not None else 0
+        lines.append(f"{len(alpha_pairs)} {header_idbk}")
+        for alpha, stem in alpha_pairs:
+            lines.append("")
+            lines.append(str(alpha).strip())
+            lines.append(str(stem).strip())
+        content = "\n".join(lines).strip() + "\n"
+        path.write_text(content)
+
+    def open_lst_editor(self) -> None:
+        if not self.loaded_lst_path:
+            messagebox.showerror("Edit LST", "Load an .LST file before editing.")
+            return
+        editor = tk.Toplevel(self.root)
+        editor.title("Edit LST Entries")
+        editor.geometry("400x420")
+        entries = list(self.loaded_alpha_pairs)
+
+        tree = ttk.Treeview(editor, columns=("ALPHA", "STEM"), show="headings", selectmode="browse")
+        tree.heading("ALPHA", text="Alpha")
+        tree.heading("STEM", text="Stem")
+        tree.column("ALPHA", width=100, anchor="center")
+        tree.column("STEM", width=220, anchor="w")
+        tree.pack(fill="both", expand=True, padx=8, pady=8)
+
+        form = ttk.Frame(editor)
+        form.pack(fill="x", padx=8)
+        ttk.Label(form, text="Alpha:").grid(row=0, column=0, sticky="e")
+        alpha_entry = ttk.Entry(form)
+        alpha_entry.grid(row=0, column=1, sticky="we", padx=(4, 0))
+        ttk.Label(form, text="Stem:").grid(row=1, column=0, sticky="e", pady=(4, 0))
+        stem_entry = ttk.Entry(form)
+        stem_entry.grid(row=1, column=1, sticky="we", padx=(4, 0), pady=(4, 0))
+        form.columnconfigure(1, weight=1)
+
+        def refresh_tree() -> None:
+            tree.delete(*tree.get_children())
+            for idx, (alpha, stem) in enumerate(entries):
+                tree.insert("", "end", iid=str(idx), values=(alpha, stem))
+
+        def clear_form() -> None:
+            alpha_entry.delete(0, tk.END)
+            stem_entry.delete(0, tk.END)
+
+        def on_select(_event: tk.Event) -> None:
+            selected = tree.selection()
+            if not selected:
+                return
+            idx = int(selected[0])
+            alpha, stem = entries[idx]
+            clear_form()
+            alpha_entry.insert(0, alpha)
+            stem_entry.insert(0, stem)
+
+        tree.bind("<<TreeviewSelect>>", on_select)
+
+        button_row = ttk.Frame(editor)
+        button_row.pack(fill="x", padx=8, pady=8)
+
+        def add_entry() -> None:
+            alpha = alpha_entry.get().strip()
+            stem = stem_entry.get().strip()
+            if not alpha or not stem:
+                messagebox.showerror("Edit LST", "Alpha and stem are required.")
+                return
+            entries.append((alpha, stem))
+            refresh_tree()
+            clear_form()
+
+        def update_entry() -> None:
+            selected = tree.selection()
+            if not selected:
+                messagebox.showerror("Edit LST", "Select an entry to update.")
+                return
+            idx = int(selected[0])
+            alpha = alpha_entry.get().strip()
+            stem = stem_entry.get().strip()
+            if not alpha or not stem:
+                messagebox.showerror("Edit LST", "Alpha and stem are required.")
+                return
+            entries[idx] = (alpha, stem)
+            refresh_tree()
+
+        def delete_entry() -> None:
+            selected = tree.selection()
+            if not selected:
+                messagebox.showerror("Edit LST", "Select an entry to delete.")
+                return
+            idx = int(selected[0])
+            del entries[idx]
+            refresh_tree()
+            clear_form()
+
+        ttk.Button(button_row, text="Add", command=add_entry).pack(side=tk.LEFT)
+        ttk.Button(button_row, text="Update", command=update_entry).pack(side=tk.LEFT, padx=4)
+        ttk.Button(button_row, text="Delete", command=delete_entry).pack(side=tk.LEFT)
+
+        def save_changes() -> None:
+            if not entries:
+                messagebox.showerror("Edit LST", "At least one entry is required.")
+                return
+            try:
+                self._write_lst_file(entries, self.idbkode, self.loaded_lst_path)
+            except OSError as exc:
+                messagebox.showerror("Edit LST", f"Unable to save LST: {exc}")
+                return
+            self._load_lst_from_path(self.loaded_lst_path)
+            editor.destroy()
+
+        ttk.Button(button_row, text="Save", command=save_changes).pack(side=tk.LEFT, padx=12)
+        ttk.Button(button_row, text="Close", command=editor.destroy).pack(side=tk.LEFT)
+
+        refresh_tree()
+
+    def populate_tables(self, alpha_pairs: List[Tuple[str, str]], base_path: Path) -> List[str]:
+        missing_files: List[str] = []
+        for config in TAB_CONFIGS:
+            state = self.tabs[config.key]
+            state.large_tree.delete(*state.large_tree.get_children())
+            self.alpha_to_files[config.key] = {}
+            self.parameter_blocks[config.key] = {}
+            self.alpha_file_paths[config.key] = {}
+            extension = self.tab_extensions.get(config.key, config.file_extension)
+            if not extension:
+                continue
+            for alpha, stem in alpha_pairs:
+                file_path = self.resolve_stem(stem, base_path, extension)
+                params: Dict[str, str] = {}
+                if file_path.exists():
+                    parsed = config.parser(file_path)
+                    if parsed:
+                        params = parsed
+                        for target, aliases in config.value_aliases.items():
+                            if target not in params:
+                                for alias in aliases:
+                                    if alias in params:
+                                        params[target] = params[alias]
+                                        break
+                    else:
+                        missing_files.append(file_path.name)
+                else:
+                    missing_files.append(file_path.name)
+                display_name = file_path.name
+                row = [alpha]
+                for header in config.value_headers:
+                    row.append(params.get(header, ""))
+                row.append(display_name)
+                alpha_key = self.normalize_alpha(alpha)
+                self.alpha_to_files[config.key][alpha_key] = display_name
+                self.alpha_file_paths[config.key][alpha_key] = file_path
+                block = self.parse_parameter_block(file_path)
+                if block:
+                    self.parameter_blocks[config.key][alpha_key] = block
+                state.large_tree.insert("", "end", values=row)
+            self.refresh_ini_table(config.key)
+        return missing_files
+
+    def refresh_diagnostics_alpha_list(self) -> None:
+        if not self.diagnostics_listbox:
+            return
+        self.diagnostics_listbox.delete(0, tk.END)
+        if not self.loaded_alpha_pairs:
+            self.diagnostics_status_var.set("Load an LST file to view diagnostics.")
+            return
+        for alpha, _ in self.loaded_alpha_pairs:
+            self.diagnostics_listbox.insert(tk.END, alpha)
+        self.diagnostics_status_var.set("Select an alpha and quantity to compare IDB vs ROP data.")
+
+    def resolve_stem(self, stem: str, base_path: Path, extension: str) -> Path:
+        candidate = Path(stem)
+        suffix = extension if extension.startswith(".") else f".{extension}"
+        if candidate.suffix.lower() != suffix.lower():
+            candidate = candidate.with_suffix(suffix)
+        if not candidate.is_absolute():
+            candidate = base_path / candidate
+        return candidate
+
+    def handle_column_click(self, event: tk.Event, tab_key: str) -> None:
+        tree = event.widget
+        column_id = tree.identify_column(event.x)
+        if not column_id or not column_id.startswith("#"):
+            return "break"
+        column_index = int(column_id[1:]) - 1
+        columns = tree["columns"]
+        if column_index >= len(columns):
+            return "break"
+        raw_header = tree.heading(columns[column_index], "text")
+        header_text = self._normalize_header(raw_header)
+        if (
+            not header_text
+            or header_text.upper().startswith("STEM")
+            or header_text.upper() == "RMS"
+            or header_text == "ROW"
+        ):
+            return "break"
+        state = self.tabs[tab_key]
+        large_index = state.column_index.get(header_text)
+        if large_index is None:
+            return "break"
+        self.selection = ColumnSelection(tab_key=tab_key, header=header_text, large_index=large_index)
+        self.update_highlights()
+        self.update_plots()
+        self.update_summary_tables()
+        self.refresh_ini_table(tab_key)
+        return "break"
+
+    def refresh_ini_table(self, tab_key: str) -> None:
+        state = self.tabs[tab_key]
+        tree = state.ini_tree
+        for entry in tree.get_children():
+            tree.delete(entry)
+        self.close_ini_editor(tab_key)
+        selection = self.selection
+        if not selection or selection.tab_key != tab_key:
+            state.ini_label_var.set("Select a column in this tab to edit its INI parameter.")
+            return
+        param_header = state.config.ini_mapping.get(selection.header)
+        if not param_header:
+            state.ini_label_var.set(f"No INI parameter available for column {selection.header}.")
+            return
+        blocks = self.parameter_blocks.get(tab_key, {})
+        if not blocks:
+            state.ini_label_var.set("INI parameters unavailable for this tab.")
+            return
+        state.ini_label_var.set(f"{selection.header} controls for all files.")
+        sorted_alphas = sorted(blocks.keys(), key=lambda a: self._safe_float(a))
+        for alpha_key in sorted_alphas:
+            block = blocks[alpha_key]
+            candidates = (param_header,) if isinstance(param_header, str) else tuple(param_header)
+            header_name = next((header for header in candidates if header in block.headers), None)
+            if not header_name:
+                continue
+            idx = block.headers.index(header_name)
+            value = block.values[idx]
+            mode = self._infer_control_mode(value)
+            mode_label = self._control_label(mode)
+            magnitude = self._entry_value_for_mode(value, mode)
+            final_value = self._preview_value_for_mode(mode, magnitude, value) or value
+            file_name = self.alpha_to_files.get(tab_key, {}).get(alpha_key, "")
+            tree.insert(
+                "",
+                "end",
+                values=(file_name, alpha_key, param_header, mode_label, magnitude, final_value),
+            )
+
+    def start_ini_edit(self, tab_key: str, event: tk.Event) -> None:
+        tree = self.tabs[tab_key].ini_tree
+        region = tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        column = tree.identify_column(event.x)
+        row_id = tree.identify_row(event.y)
+        if not row_id:
+            return
+        alpha_key = tree.set(row_id, "ALPHA")
+        parameter = tree.set(row_id, "PARAM")
+        if column == "#4":
+            self.start_ini_mode_editor(tab_key, tree, row_id, column, alpha_key, parameter)
+        elif column == "#5":
+            self.start_ini_value_editor(tab_key, tree, row_id, column, alpha_key, parameter)
+        else:
+            return
+
+    def start_ini_mode_editor(
+        self,
+        tab_key: str,
+        tree: ttk.Treeview,
+        row_id: str,
+        column: str,
+        alpha_key: str,
+        parameter: str,
+    ) -> None:
+        bbox = tree.bbox(row_id, column)
+        if not bbox:
+            return
+        self.close_ini_editor(tab_key)
+        combo = ttk.Combobox(tree, state="readonly", values=[label for _, label in self.CONTROL_OPTIONS])
+        combo.set(tree.set(row_id, "MODE"))
+        x, y, width, height = bbox
+        combo.place(x=x, y=y, width=width, height=height)
+        combo.focus()
+
+        def commit(event=None) -> None:
+            mode_label = combo.get()
+            magnitude = tree.set(row_id, "VALUE")
+            if self.commit_ini_change(tab_key, alpha_key, parameter, mode_label, magnitude):
+                self.close_ini_editor(tab_key)
+            else:
+                combo.focus()
+
+        combo.bind("<<ComboboxSelected>>", commit)
+        combo.bind("<FocusOut>", commit)
+        combo.bind("<Escape>", lambda _e: self.close_ini_editor(tab_key))
+        self.ini_inline_widgets[tab_key] = combo
+
+    def start_ini_value_editor(
+        self,
+        tab_key: str,
+        tree: ttk.Treeview,
+        row_id: str,
+        column: str,
+        alpha_key: str,
+        parameter: str,
+    ) -> None:
+        bbox = tree.bbox(row_id, column)
+        if not bbox:
+            return
+        current_value = tree.set(row_id, "VALUE")
+        self.close_ini_editor(tab_key)
+        entry = tk.Entry(tree)
+        entry.insert(0, current_value)
+        x, y, width, height = bbox
+        entry.place(x=x, y=y, width=width, height=height)
+        entry.focus()
+
+        def commit(event=None) -> None:
+            new_value = entry.get().strip()
+            mode_label = tree.set(row_id, "MODE")
+            if self.commit_ini_change(tab_key, alpha_key, parameter, mode_label, new_value):
+                self.close_ini_editor(tab_key)
+            else:
+                entry.focus()
+
+        entry.bind("<Return>", commit)
+        entry.bind("<FocusOut>", commit)
+        entry.bind("<Escape>", lambda _event: self.close_ini_editor(tab_key))
+        self.ini_inline_widgets[tab_key] = entry
+
+    def close_ini_editor(self, tab_key: str) -> None:
+        widget = self.ini_inline_widgets.get(tab_key)
+        if widget is not None:
+            widget.destroy()
+        self.ini_inline_widgets[tab_key] = None
+
+    def commit_ini_change(
+        self,
+        tab_key: str,
+        alpha_key: str,
+        parameter: str,
+        mode_label: str,
+        magnitude_text: str,
+    ) -> bool:
+        block = self.parameter_blocks.get(tab_key, {}).get(alpha_key)
+        if not block:
+            messagebox.showerror("INI Update", "Unable to locate parameter block for this selection.")
+            return False
+        try:
+            index = block.headers.index(parameter)
+        except ValueError:
+            return False
+        mode_code = self._mode_from_label(mode_label)
+        magnitude = magnitude_text.strip()
+        if mode_code != "estimate" and not magnitude:
+            magnitude = "1"
+        formatted = self._format_value_for_mode(parameter, mode_code, magnitude, block.values[index])
+        if formatted is None:
+            return False
+        block.values[index] = formatted
+        return self.apply_ini_changes(block, block.values)
+
+    def adjust_power(self, tab_key: str, delta: int) -> None:
+        if not self.selection or self.selection.tab_key != tab_key:
+            return
+        state = self.tabs[tab_key]
+        column_id = self._column_id_for_header(state.small_tree, self.selection.header)
+        row_id = state.small_rows.get("PWR")
+        if not column_id or not row_id:
+            return
+        try:
+            current = int(state.small_tree.set(row_id, column_id) or "0")
+        except ValueError:
+            current = 0
+        new_value = max(0, current + delta)
+        state.small_tree.set(row_id, column_id, str(new_value))
+        self.update_polynomial_models()
+        self.update_plots()
+        self.update_summary_tables()
+        self.update_highlights()
+
+    def open_ini_editor(self) -> None:
+        initialdir = str(self.loaded_base_path) if self.loaded_base_path else None
+        file_path = filedialog.askopenfilename(
+            title="Select Parameter File",
+            filetypes=[("Parameter Files", "*.DBE *.2LM"), ("DBE Files", "*.DBE"), ("2LM Files", "*.2LM")],
+            initialdir=initialdir,
+        )
+        if not file_path:
+            return
+        selected_path = Path(file_path)
+        block = self.parse_parameter_block(selected_path)
+        if not block:
+            display_name = selected_path.name or str(selected_path)
+            messagebox.showerror("Change INI", f'Could not find editable parameters in "{display_name}".')
+            return
+        self._show_ini_window(block)
+
+    def parse_parameter_block(self, path: Path) -> Optional[ParameterBlock]:
+        try:
+            lines = path.read_text().splitlines()
+        except OSError as exc:
+            self.set_status(f"Unable to read {path.name}: {exc}")
+            return None
+        marker_index = next((i for i, line in enumerate(lines) if "PARAMETER CONTROL" in line.upper()), None)
+        if marker_index is None:
+            return None
+        header_index = self._find_parameter_header_index(lines, marker_index + 1)
+        if header_index is None:
+            return None
+        value_index = self._find_parameter_value_index(lines, header_index + 1)
+        if value_index is None:
+            return None
+        headers = lines[header_index].split()
+        values = lines[value_index].split()
+        if not headers or not values or len(values) < len(headers):
+            return None
+        return ParameterBlock(path=path, headers=headers, values=values, header_index=header_index, value_index=value_index, lines=lines)
+
+    def _find_parameter_header_index(self, lines: List[str], start: int) -> Optional[int]:
+        for idx in range(start, len(lines)):
+            tokens = lines[idx].split()
+            if not tokens:
+                continue
+            if all(self._token_has_digit(token) for token in tokens):
+                return idx
+        return None
+
+    def _find_parameter_value_index(self, lines: List[str], start: int) -> Optional[int]:
+        for idx in range(start, len(lines)):
+            tokens = lines[idx].split()
+            if not tokens:
+                continue
+            if all(self._is_numeric_token(token) for token in tokens):
+                return idx
+        return None
+
+    @staticmethod
+    def _token_has_digit(token: str) -> bool:
+        return any(char.isdigit() for char in token)
+
+    @staticmethod
+    def _is_numeric_token(token: str) -> bool:
+        cleaned = token.rstrip(",;")
+        try:
+            float(cleaned)
+            return True
+        except ValueError:
+            return False
+
+    def _control_label(self, mode: str) -> str:
+        mapping = dict(self.CONTROL_OPTIONS)
+        return mapping.get(mode, self.CONTROL_OPTIONS[0][1])
+
+    def _mode_from_label(self, label: str) -> str:
+        reverse = {text: code for code, text in self.CONTROL_OPTIONS}
+        return reverse.get(label, "estimate")
+
+    def _infer_control_mode(self, value_text: str) -> str:
+        try:
+            value = float(value_text)
+        except (TypeError, ValueError):
+            return "estimate"
+        if abs(value) < 1e-12:
+            return "estimate"
+        if value < 0:
+            return "negative"
+        return "fix"
+
+    def _entry_value_for_mode(self, value_text: str, mode: str) -> str:
+        stripped = value_text.strip()
+        if not stripped:
+            return ""
+        if mode == "estimate":
+            return ""
+        if stripped.startswith(("+", "-")):
+            stripped = stripped[1:]
+        return stripped
+
+    def _on_control_mode_changed(
+        self,
+        entry: ttk.Entry,
+        mode: str,
+        original_value: str,
+        preview_label: ttk.Label,
+        mode_var: tk.StringVar,
+    ) -> None:
+        if mode == "estimate":
+            entry.delete(0, tk.END)
+            entry.state(["disabled"])
+        else:
+            if "disabled" in entry.state():
+                default = self._entry_value_for_mode(original_value, mode) or "1"
+                entry.delete(0, tk.END)
+                entry.insert(0, default)
+            entry.state(["!disabled"])
+        self._update_preview_label(mode, entry.get().strip(), original_value, preview_label)
+
+    def _update_preview_label(
+        self,
+        mode: str,
+        entry_value: str,
+        original_value: str,
+        label: ttk.Label,
+    ) -> None:
+        preview = self._preview_value_for_mode(mode, entry_value, original_value)
+        label.config(text=preview if preview is not None else "")
+
+    def _preview_value_for_mode(
+        self,
+        mode: str,
+        entry_value: str,
+        original_value: str,
+    ) -> Optional[str]:
+        if mode == "estimate":
+            return "0"
+        text = entry_value.strip()
+        if not text:
+            text = self._entry_value_for_mode(original_value, mode) or ""
+        if not text:
+            return None
+        try:
+            numeric = float(text)
+        except ValueError:
+            return None
+        if numeric <= 0:
+            return None
+        normalized = text.lstrip("+")
+        if mode == "negative":
+            normalized = normalized.lstrip("-")
+            if not normalized:
+                normalized = "1"
+            normalized = f"-{normalized}"
+        return normalized
+
+    def _format_value_for_mode(
+        self,
+        header: str,
+        mode: str,
+        entry_value: str,
+        original_value: str,
+    ) -> Optional[str]:
+        preview = self._preview_value_for_mode(mode, entry_value, original_value)
+        if preview is None:
+            messagebox.showerror("Change INI", f"{header}: enter a valid positive number.")
+            return None
+        return preview
+
+    def _show_ini_window(self, block: ParameterBlock) -> None:
+        window = tk.Toplevel(self.root)
+        window.title(f"Change INI – {block.path.name}")
+        ttk.Label(
+            window,
+            text="0 = let computer estimate, >0 = keep parameter fixed, <0 = use negative value as initial guess.",
+            wraplength=420,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=6, pady=(6, 10))
+        rows: List[ParameterEditorRow] = []
+        for idx, header in enumerate(block.headers):
+            value_text = block.values[idx] if idx < len(block.values) else ""
+            ttk.Label(window, text=header).grid(row=idx + 1, column=0, sticky="e", padx=6, pady=3)
+            mode = self._infer_control_mode(value_text)
+            mode_var = tk.StringVar(value=self._control_label(mode))
+            combo = ttk.Combobox(
+                window,
+                state="readonly",
+                values=[label for _, label in self.CONTROL_OPTIONS],
+                textvariable=mode_var,
+                width=30,
+            )
+            combo.set(mode_var.get())
+            combo.grid(row=idx + 1, column=1, sticky="w", padx=6, pady=3)
+            entry = ttk.Entry(window, width=16)
+            entry_value = self._entry_value_for_mode(value_text, mode)
+            entry.insert(0, entry_value)
+            if mode == "estimate":
+                entry.state(["disabled"])
+            preview = ttk.Label(window, text=value_text, width=16, anchor="w")
+            preview.grid(row=idx + 1, column=3, sticky="w", padx=(6, 0))
+
+            def combo_handler(evt, e=entry, var=mode_var, original=value_text, label=preview):
+                self._on_control_mode_changed(e, self._mode_from_label(var.get()), original, label, var)
+
+            combo.bind("<<ComboboxSelected>>", combo_handler)
+            entry.bind(
+                "<KeyRelease>",
+                lambda _event, e=entry, var=mode_var, original=value_text, label=preview: self._update_preview_label(
+                    self._mode_from_label(var.get()),
+                    e.get().strip(),
+                    original,
+                    label,
+                ),
+            )
+            entry.grid(row=idx + 1, column=2, sticky="w", padx=6, pady=3)
+            rows.append(
+                ParameterEditorRow(
+                    header=header,
+                    mode_var=mode_var,
+                    value_entry=entry,
+                    original_value=value_text,
+                    preview_label=preview,
+                )
+            )
+
+        def on_save() -> None:
+            new_values: List[str] = []
+            for row in rows:
+                mode = self._mode_from_label(row.mode_var.get())
+                value_text = row.value_entry.get().strip()
+                formatted = self._format_value_for_mode(row.header, mode, value_text, row.original_value)
+                if formatted is None:
+                    return
+                new_values.append(formatted)
+            if self.apply_ini_changes(block, new_values):
+                window.destroy()
+
+        def on_cancel() -> None:
+            window.destroy()
+
+        button_frame = ttk.Frame(window)
+        button_frame.grid(row=len(block.headers) + 1, column=0, columnspan=3, pady=(12, 6))
+        ttk.Button(button_frame, text="Save", command=on_save).pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=6)
+        window.grab_set()
+        window.transient(self.root)
+        window.focus_set()
+
+    def apply_ini_changes(self, block: ParameterBlock, values: List[str]) -> bool:
+        if len(values) != len(block.headers):
+            messagebox.showerror("Change INI", "Parameter count mismatch.")
+            return False
+        lines = list(block.lines)
+        template = lines[block.value_index] if block.value_index < len(lines) else ""
+        lines[block.value_index] = self._format_ini_line(template, values)
+        try:
+            block.path.write_text("\n".join(lines) + "\n")
+        except OSError as exc:
+            messagebox.showerror("Change INI", f"Unable to save changes: {exc}")
+            return False
+        self.reload_after_ini_change(block.path)
+        return True
+
+    def _format_ini_line(self, template: str, values: List[str]) -> str:
+        indent = len(template) - len(template.lstrip(" "))
+        return (" " * max(indent, 0)) + "   ".join(values)
+
+    def reload_after_ini_change(self, path: Path) -> None:
+        if self.loaded_alpha_pairs and self.loaded_base_path:
+            missing = self.populate_tables(self.loaded_alpha_pairs, self.loaded_base_path)
+            status_msg = f"Updated INI in {path.name}; reloaded {self.loaded_lst_name or 'data'} (rerun LSF tool to refresh fit results)"
+            if missing:
+                status_msg += f"; missing {len(missing)} file(s)"
+            self.set_status(status_msg)
+            if self.loaded_lst_path:
+                self.load_lsf_data(self.loaded_lst_path)
+            self.update_expected_extensions()
+            self.update_plots()
+            self.update_summary_tables()
+            self.update_polynomial_models()
+            self.update_highlights()
+            for key in self.tabs:
+                self.refresh_ini_table(key)
+        else:
+            self.set_status(f"Updated INI in {path.name}. Load an LST file to view changes.")
+
+    def load_lsf_data(self, lst_path: Path) -> None:
+        self.lsf_data = {"EPS": {}, "MUS": {}}
+        self.loaded_lsf_path = None
+        candidate = self._find_lsf_path(lst_path)
+        if not candidate:
+            return
+        try:
+            lines = candidate.read_text().splitlines()
+        except OSError as exc:
+            self.set_status(f"Unable to read {candidate.name}: {exc}")
+            return
+        self.lsf_data = self.parse_lsf_lines(lines)
+        self.loaded_lsf_path = candidate
+
+    def _clear_snapshot_dir(self) -> None:
+        if self.snapshot_dir and self.snapshot_dir.exists():
+            shutil.rmtree(self.snapshot_dir, ignore_errors=True)
+        self.snapshot_dir = None
+        self.snapshot_map = {}
+
+    def create_file_snapshot(self) -> None:
+        if not self.loaded_alpha_pairs or not self.loaded_base_path:
+            return
+        self._clear_snapshot_dir()
+        try:
+            snapshot_root = Path(tempfile.mkdtemp(prefix="materials_snapshot_"))
+        except OSError as exc:
+            self.set_status(f"Unable to create snapshot: {exc}")
+            return
+        self.snapshot_dir = snapshot_root
+        recorded_paths = set()
+        for paths in self.alpha_file_paths.values():
+            recorded_paths.update(paths.values())
+        for original_path in recorded_paths:
+            if not original_path.exists():
+                continue
+            try:
+                relative_path = original_path.relative_to(self.loaded_base_path)
+            except ValueError:
+                relative_path = Path(original_path.name)
+            destination = snapshot_root / relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(original_path, destination)
+            except OSError as exc:
+                self.set_status(f"Snapshot failed for {original_path.name}: {exc}")
+                continue
+            self.snapshot_map[original_path] = destination
+
+    def restore_original_files(self) -> None:
+        if not self.snapshot_map:
+            messagebox.showinfo("Restore Originals", "No snapshot available. Load an .LST file first.")
+            return
+        failures: List[str] = []
+        for original_path, snapshot_path in self.snapshot_map.items():
+            if not snapshot_path.exists():
+                failures.append(f"Snapshot missing for {original_path.name}")
+                continue
+            try:
+                original_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(snapshot_path, original_path)
+            except OSError as exc:
+                failures.append(f"{original_path.name}: {exc}")
+        if failures:
+            messagebox.showerror("Restore Originals", "\n".join(failures[:10]) + ("\n..." if len(failures) > 10 else ""))
+        else:
+            self.set_status("Restored original parameter files.")
+        if self.loaded_alpha_pairs and self.loaded_base_path:
+            missing = self.populate_tables(self.loaded_alpha_pairs, self.loaded_base_path)
+            if missing:
+                messagebox.showwarning(
+                    "Restore Originals",
+                    "Unable to reload some files after restore:\n" + "\n".join(missing[:10]),
+                )
+            if self.loaded_lst_path:
+                self.load_lsf_data(self.loaded_lst_path)
+            self.update_plots()
+            self.update_summary_tables()
+            self.update_highlights()
+            self.update_polynomial_models()
+            for key in self.tabs:
+                self.refresh_ini_table(key)
+
+    def run_tab_fits(
+        self,
+        tab_key: str,
+        silent: bool = False,
+        error_list: Optional[List[str]] = None,
+        reload: bool = True,
+    ) -> int:
+        if not self.loaded_alpha_pairs or not self.loaded_base_path:
+            if not silent:
+                messagebox.showerror("Run Fits", "Load an .LST file before running fits.")
+            return 0
+        config = self.tabs[tab_key].config
+        total = len(self.loaded_alpha_pairs)
+        successes = 0
+        local_errors: List[str] = []
+        for idx, (alpha_text, stem) in enumerate(self.loaded_alpha_pairs, start=1):
+            alpha_key = self.normalize_alpha(alpha_text)
+            measurement_path = self._measurement_path_for_stem(stem, self.loaded_base_path)
+            if not measurement_path:
+                local_errors.append(f"{stem}: measurement file (.ROP/.EMU) not found")
+                continue
+            try:
+                rop_data = read_material_file(measurement_path)
+            except Exception as exc:  # noqa: BLE001
+                local_errors.append(f"{stem}: unable to read measurement data: {exc}")
+                continue
+            output_path = self.alpha_file_paths.get(tab_key, {}).get(alpha_key)
+            if not output_path:
+                extension = self.tab_extensions.get(tab_key, config.file_extension)
+                output_path = self.resolve_stem(stem, self.loaded_base_path, extension)
+            try:
+                if tab_key == "EPS":
+                    controls = self._build_debye_controls(alpha_key)
+                    result = fit_debye(rop_data, controls)
+                    report = generate_dbe_report(
+                        rop_data,
+                        controls,
+                        result,
+                        input_file=measurement_path,
+                        output_file=output_path,
+                    )
+                else:
+                    controls = self._build_double_lorentz_controls(alpha_key)
+                    result = fit_double_lorentz(rop_data, "mu", controls)
+                    report = generate_dlm_report(
+                        rop_data,
+                        "mu",
+                        controls,
+                        result,
+                        input_file=measurement_path,
+                        output_file=output_path,
+                    )
+                output_path.write_text(report)
+                successes += 1
+                if not silent:
+                    self.set_status(
+                        f"[{tab_key}] Fitted {stem} ({idx}/{total}); RMS={result.rms:.4f}"
+                    )
+                    self.root.update_idletasks()
+                if result.iflag != 0:
+                    local_errors.append(f"{stem}: solver reached iteration limit")
+            except Exception as exc:  # noqa: BLE001
+                local_errors.append(f"{stem}: {exc}")
+                continue
+        if successes and reload:
+            missing = self.populate_tables(self.loaded_alpha_pairs, self.loaded_base_path)
+            if missing:
+                local_errors.extend(f"{name}: could not reload" for name in missing)
+            if self.loaded_lst_path:
+                self.load_lsf_data(self.loaded_lst_path)
+            self.update_plots()
+            self.update_summary_tables()
+            self.update_highlights()
+            self.update_polynomial_models()
+            for key in self.tabs:
+                self.refresh_ini_table(key)
+            if not silent:
+                self.set_status(f"[{tab_key}] Updated {successes} file(s).")
+        if local_errors:
+            if error_list is not None:
+                error_list.extend(local_errors)
+            elif not silent:
+                messagebox.showerror(
+                    "Run Fits",
+                    "\n".join(local_errors[:10]) + ("\n..." if len(local_errors) > 10 else ""),
+                )
+        return successes
+
+    def update_expected_extensions(self) -> None:
+        ceps_ext = self.tab_extensions.get("EPS", ".DBE")
+        cmu_ext = self.tab_extensions.get("MUS", ".2LM")
+        if self.idbkode is None:
+            self.tab_extensions["EPS"] = ceps_ext
+            self.tab_extensions["MUS"] = cmu_ext
+            return
+        if self.idbkode < 10:
+            mapping = {
+                0: (".DBE", None),
+                1: (".LNE", None),
+                2: (".DBE", ".DBM"),
+                3: (".LNE", ".DBM"),
+                4: (".DBE", ".LNM"),
+                5: (".LNE", ".LNM"),
+            }
+            ceps_ext, cmu_ext = mapping.get(self.idbkode, (ceps_ext, cmu_ext))
+        else:
+            ce_map = {
+                0: None,
+                1: ".DBE",
+                2: ".LNE",
+                3: ".2DE",
+                4: ".2LE",
+                5: ".3DE",
+                6: ".DLE",
+            }
+            cm_map = {
+                0: None,
+                1: ".DBM",
+                2: ".LNM",
+                3: ".2DM",
+                4: ".2LM",
+                5: ".3DM",
+                6: ".DLM",
+            }
+            idbke = self.idbkode // 10
+            idbkm = self.idbkode % 10
+            ceps_ext = ce_map.get(idbke, ceps_ext)
+            cmu_ext = cm_map.get(idbkm, cmu_ext)
+        self.tab_extensions["EPS"] = ceps_ext
+        self.tab_extensions["MUS"] = cmu_ext
+
+    def _find_lsf_path(self, lst_path: Path) -> Optional[Path]:
+        candidates = [
+            lst_path.with_suffix(".LSF"),
+            lst_path.with_suffix(".lsf"),
+        ]
+        for stem in ("Material", "material"):
+            candidates.append(lst_path.parent / f"{stem}.LSF")
+            candidates.append(lst_path.parent / f"{stem}.lsf")
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    def parse_lsf_lines(self, lines: List[str]) -> Dict[str, Dict[str, Dict[str, str]]]:
+        data: Dict[str, Dict[str, Dict[str, str]]] = {"EPS": {}, "MUS": {}}
+        current: Optional[str] = None
+        reading = False
+        for line in lines:
+            stripped = line.strip()
+            upper = stripped.upper()
+            if upper.startswith("LSF CEPS DATA"):
+                current = "EPS"
+                reading = False
+                continue
+            if upper.startswith("LSF CMU DATA"):
+                current = "MUS"
+                reading = False
+                continue
+            if not current:
+                continue
+            if stripped.startswith("!"):
+                if "ALPHA" in upper and "LSF" in upper:
+                    reading = True
+                continue
+            if reading:
+                if not stripped:
+                    reading = False
+                    continue
+                if upper.startswith("LSF ") or upper.startswith("DLPAR") or upper.startswith("IX,"):
+                    reading = False
+                    continue
+                tokens = stripped.split()
+                if len(tokens) < 3:
+                    continue
+                try:
+                    alpha_value = float(tokens[0])
+                except ValueError:
+                    reading = False
+                    continue
+                lsf_file = tokens[-1]
+                values = tokens[1:-1]
+                normalized_alpha = self.normalize_alpha(alpha_value)
+                data[current][normalized_alpha] = {
+                    "file": lsf_file,
+                    "values": values,
+                }
+        return data
+
+    def update_highlights(self) -> None:
+        for state in self.tabs.values():
+            self._clear_column_overlays(state.large_overlays)
+            self._clear_column_overlays(state.small_overlays)
+        if not self.selection:
+            return
+        selected_state = self.tabs[self.selection.tab_key]
+        self._highlight_column_cells(selected_state.large_tree, self.selection.header, selected_state.large_overlays)
+        self._highlight_column_cells(selected_state.small_tree, self.selection.header, selected_state.small_overlays)
+
+    def _column_id_for_header(self, tree: ttk.Treeview, header_text: str) -> Optional[str]:
+        for column_id in tree["columns"]:
+            text = tree.heading(column_id, "text")
+            if self._normalize_header(text) == header_text:
+                return column_id
+        return None
+
+    def _clear_column_overlays(self, overlays: List[tk.Widget]) -> None:
+        while overlays:
+            overlay = overlays.pop()
+            overlay.destroy()
+
+    def _highlight_column_cells(
+        self,
+        tree: ttk.Treeview,
+        header_text: str,
+        overlays: List[tk.Widget],
+    ) -> None:
+        column_id = self._column_id_for_header(tree, header_text)
+        if not column_id:
+            return
+        for item in tree.get_children():
+            bbox = tree.bbox(item, column=column_id)
+            if not bbox:
+                continue
+            x, y, width, height = bbox
+            value = tree.set(item, column_id)
+            overlay = tk.Label(
+                tree,
+                text=value,
+                bg="#ffe28a",
+                fg="#000000",
+                borderwidth=0,
+                font=("TkDefaultFont", 10),
+                anchor="center",
+            )
+            overlay.place(x=x, y=y, width=width, height=height)
+            overlay.bind(
+                "<Button-1>",
+                lambda event, t=tree, w=overlay: self._forward_tree_event(t, w, "<Button-1>", event),
+            )
+            overlay.bind(
+                "<ButtonRelease-1>",
+                lambda event, t=tree, w=overlay: self._forward_tree_event(t, w, "<ButtonRelease-1>", event),
+            )
+            overlays.append(overlay)
+
+    def _forward_tree_event(self, tree: ttk.Treeview, widget: tk.Widget, sequence: str, event: tk.Event) -> None:
+        tree.event_generate(
+            sequence,
+            x=event.x + widget.winfo_x(),
+            y=event.y + widget.winfo_y(),
+        )
+
+    def update_diagnostics_plot(self) -> None:
+        if not self.diagnostics_listbox:
+            return
+        selection = self.diagnostics_listbox.curselection()
+        self.diagnostics_axes_real.clear()
+        self.diagnostics_axes_imag.clear()
+        self.diagnostics_axes_real.set_ylabel("Real")
+        self.diagnostics_axes_imag.set_ylabel("Imag")
+        self.diagnostics_axes_imag.set_xlabel("Frequency (GHz)")
+        if not selection or not self.loaded_alpha_pairs or not self.loaded_base_path:
+            self.diagnostics_axes_real.text(0.5, 0.5, "Select an entry", ha="center", va="center")
+            self.diagnostics_axes_imag.text(0.5, 0.5, "", ha="center", va="center")
+            self.diagnostics_canvas.draw()
+            return
+        alpha_text = self.diagnostics_listbox.get(selection[0])
+        alpha_key = self.normalize_alpha(alpha_text)
+        stem = self.alpha_to_stem.get(alpha_key)
+        if not stem:
+            self.diagnostics_status_var.set(f"No stem found for alpha {alpha_text}.")
+            self.diagnostics_canvas.draw()
+            return
+        measurement_path = self._measurement_path_for_stem(stem, self.loaded_base_path)
+        if not measurement_path:
+            self.diagnostics_status_var.set(f"Measurement file missing for {stem}.")
+            self.diagnostics_canvas.draw()
+            return
+        try:
+            rop_data = read_material_file(measurement_path)
+        except Exception as exc:  # noqa: BLE001
+            self.diagnostics_status_var.set(f"Unable to read {stem}: {exc}")
+            self.diagnostics_canvas.draw()
+            return
+        self.update_polynomial_models()
+        quantity = self.diagnostics_quantity_var.get() if self.diagnostics_quantity_var else "EPS"
+        alpha_float = self._safe_float(alpha_text)
+        if quantity == "EPS":
+            measured_real = rop_data.eps_real
+            measured_imag = rop_data.eps_imag
+        else:
+            measured_real = rop_data.mu_real
+            measured_imag = rop_data.mu_imag
+        freq = rop_data.frequencies_ghz
+        prediction = self._compute_idb_prediction(alpha_float, freq, quantity)
+        if prediction is None:
+            self.diagnostics_status_var.set(
+                "Polynomial models not available for the selected parameters."
+            )
+            self.diagnostics_canvas.draw()
+            return
+        fitted_real, fitted_imag = prediction
+        self.diagnostics_axes_real.plot(freq, measured_real, label="Measured", color="#555555")
+        self.diagnostics_axes_real.plot(freq, fitted_real, label="IDB", color="#d9534f")
+        self.diagnostics_axes_imag.plot(freq, measured_imag, label="Measured", color="#555555")
+        self.diagnostics_axes_imag.plot(freq, fitted_imag, label="IDB", color="#0275d8")
+        self.diagnostics_axes_real.legend(loc="best")
+        self.diagnostics_axes_imag.legend(loc="best")
+        self.diagnostics_axes_real.set_title(f"Alpha {alpha_text} ({quantity})")
+        self.diagnostics_status_var.set(
+            f"Comparing measurement vs IDB prediction for {stem} ({quantity})."
+        )
+        self.diagnostics_canvas.draw()
+
+    def _compute_idb_prediction(
+        self,
+        alpha_value: float,
+        frequencies: List[float],
+        tab_key: str,
+    ) -> Optional[Tuple[List[float], List[float]]]:
+        if tab_key == "EPS":
+            headers = ("FRES", "DEPS", "EPSV", "GAMMA", "SIGE")
+            params = {}
+            for header in headers:
+                value = self.evaluate_polynomial("EPS", header, alpha_value)
+                if value is None:
+                    return None
+                params[header] = value
+            def compute(freq: float) -> complex:
+                return compute_debye_ceps(
+                    freq,
+                    params["FRES"],
+                    params["DEPS"],
+                    params["EPSV"],
+                    params["GAMMA"],
+                    params["SIGE"],
+                )
+        else:
+            headers = (
+                "FR_M1",
+                "DMUR1",
+                "GAMM1",
+                "FR_M2",
+                "DMUR2",
+                "GAMM2",
+                "MURV",
+                "EPSV",
+            )
+            params = {}
+            for header in headers:
+                value = self.evaluate_polynomial("MUS", header, alpha_value)
+                if value is None:
+                    return None
+                params[header] = value
+            def compute(freq: float) -> complex:
+                return compute_debye_lorentz_ceps(
+                    freq,
+                    params["FR_M1"],
+                    params["DMUR1"],
+                    params["GAMM1"],
+                    params["FR_M2"],
+                    params["DMUR2"],
+                    params["GAMM2"],
+                    params["MURV"],
+                    params["EPSV"],
+                )
+        real_vals = []
+        imag_vals = []
+        for freq in frequencies:
+            value = compute(freq)
+            real_vals.append(value.real)
+            imag_vals.append(value.imag)
+        return real_vals, imag_vals
+
+    def update_plots(self) -> None:
+        for state in self.tabs.values():
+            self._update_plot_for_state(state)
+
+    def _update_plot_for_state(self, state: TabState) -> None:
+        state.axes.clear()
+        state.axes.set_xlabel("Alpha")
+        state.axes.set_ylabel("Value")
+        if not self.selection:
+            state.axes.set_title("Select a column to plot")
+            state.canvas.draw()
+            return
+        column_index = state.column_index.get(self.selection.header)
+        if column_index is None:
+            state.axes.set_title(f"{self.selection.header} not available in {state.config.key}")
+            state.canvas.draw()
+            return
+        x_vals: List[float] = []
+        y_vals: List[float] = []
+        y_fit_vals: List[Optional[float]] = []
+        for item in state.large_tree.get_children():
+            values = state.large_tree.item(item, "values")
+            if not values:
+                continue
+            alpha_val = self._safe_float(values[0])
+            x_vals.append(alpha_val)
+            raw_value = values[column_index] if len(values) > column_index else ""
+            y_vals.append(self._safe_float(raw_value))
+            y_fit_vals.append(self.evaluate_polynomial(state.config.key, self.selection.header, alpha_val))
+        state.axes.plot(x_vals, y_vals, marker="x", linestyle="None", color=state.config.plot_color, label="LSF Data")
+        model = self.polynomial_models.get(state.config.key, {}).get(self.selection.header)
+        if x_vals and model:
+            alpha_min, alpha_max = min(x_vals), max(x_vals)
+            sample_count = max(50, len(x_vals) * 10)
+            alpha_line = np.linspace(alpha_min, alpha_max, sample_count)
+            fit_line = [
+                self.evaluate_polynomial(state.config.key, self.selection.header, float(alpha))
+                for alpha in alpha_line
+            ]
+            state.axes.plot(alpha_line, fit_line, color="black", linewidth=1.5, label=f"Polynomial (PWR {model['power']})")
+        rms_value = model["rms"] if model else None
+        rms_text = f"{rms_value:.4g}" if rms_value is not None else "N/A"
+        state.axes.set_title(f"{self.selection.header} vs. Alpha (PWR={model['power'] if model else 'N/A'}, RMS={rms_text})")
+        state.axes.legend(loc="best")
+        state.canvas.draw()
+
+    def get_small_table_value(self, state: TabState, row_label: str, header_text: str) -> str:
+        row_id = state.small_rows.get(row_label)
+        column_id = self._column_id_for_header(state.small_tree, header_text)
+        if not row_id or not column_id:
+            return ""
+        return state.small_tree.set(row_id, column_id) or ""
+
+    def update_summary_tables(self) -> None:
+        for state in self.tabs.values():
+            self._update_summary_for_state(state)
+
+    def _update_summary_for_state(self, state: TabState) -> None:
+        state.summary_tree.delete(*state.summary_tree.get_children())
+        if not self.selection:
+            state.summary_label.config(text='LSF / IDB / Δ VALUES OF "COLUMN" AT SPECIFIED ALPHAS')
+            return
+        column_index = state.column_index.get(self.selection.header)
+        if column_index is None:
+            state.summary_label.config(text=f"{self.selection.header} not found for {state.config.key}")
+            return
+        state.summary_label.config(
+            text=f'LSF / IDB / Δ VALUES OF {self.selection.header} AT SPECIFIED ALPHAS'
+        )
+        models_for_tab = self.polynomial_models.get(state.config.key, {})
+        for item in state.large_tree.get_children():
+            values = state.large_tree.item(item, "values")
+            if not values:
+                continue
+            alpha_text = values[0]
+            alpha_val = self._safe_float(alpha_text)
+            lsf_val: Optional[float] = None
+            if len(values) > column_index:
+                try:
+                    lsf_val = float(values[column_index])
+                except (TypeError, ValueError):
+                    lsf_val = None
+            idb_val = self.evaluate_polynomial(state.config.key, self.selection.header, alpha_val)
+            delta_val = lsf_val - idb_val if (lsf_val is not None and idb_val is not None) else None
+            state.summary_tree.insert(
+                "",
+                "end",
+                values=(
+                    self._format_value(alpha_val),
+                    self._format_value(lsf_val),
+                    self._format_value(idb_val),
+                    self._format_value(delta_val),
+                ),
+            )
+
+    def update_polynomial_models(self) -> None:
+        for key, state in self.tabs.items():
+            self.polynomial_models[key] = self._compute_polynomial_models(state)
+
+    def _compute_polynomial_models(self, state: TabState) -> Dict[str, Dict[str, Any]]:
+        models: Dict[str, Dict[str, Any]] = {}
+        power_row_id = state.small_rows.get("PWR")
+        rms_row_id = state.small_rows.get("RMS")
+        if rms_row_id:
+            for header in state.config.polynomial_headers:
+                column_id = self._column_id_for_header(state.small_tree, header)
+                if column_id:
+                    state.small_tree.set(rms_row_id, column_id, "")
+        alpha_vals: List[float] = []
+        per_header_values: Dict[str, List[float]] = {header: [] for header in state.config.polynomial_headers}
+        for item in state.large_tree.get_children():
+            row = state.large_tree.item(item, "values")
+            if not row:
+                continue
+            alpha_val = self._safe_float(row[0])
+            alpha_vals.append(alpha_val)
+            for header in state.config.polynomial_headers:
+                col_idx = state.column_index.get(header)
+                if col_idx is None or col_idx >= len(row):
+                    continue
+                per_header_values.setdefault(header, []).append(self._safe_float(row[col_idx]))
+        if not alpha_vals or self.alpha0 is None:
+            return models
+        centered_alphas = np.array([val - self.alpha0 for val in alpha_vals], dtype=float)
+        for header in state.config.polynomial_headers:
+            values = per_header_values.get(header, [])
+            if len(values) != len(alpha_vals) or not values:
+                continue
+            power = self._get_power_for_header(state, header, power_row_id)
+            max_power = min(power, len(alpha_vals) - 1)
+            coeffs, rms = self._fit_polynomial(centered_alphas, np.array(values, dtype=float), max_power)
+            if coeffs is None:
+                continue
+            models[header] = {"power": max_power, "coeffs": coeffs, "rms": rms}
+            if rms_row_id:
+                column_id = self._column_id_for_header(state.small_tree, header)
+                if column_id:
+                    state.small_tree.set(rms_row_id, column_id, f"{rms:.4f}")
+        return models
+
+    def _get_power_for_header(self, state: TabState, header: str, row_id: Optional[str]) -> int:
+        if not row_id:
+            return 0
+        column_id = self._column_id_for_header(state.small_tree, header)
+        if not column_id:
+            return 0
+        try:
+            return max(0, int(state.small_tree.set(row_id, column_id) or 0))
+        except ValueError:
+            return 0
+
+    def _fit_polynomial(
+        self,
+        x_vals: np.ndarray,
+        y_vals: np.ndarray,
+        degree: int,
+    ) -> Tuple[Optional[List[float]], float]:
+        if degree < 0:
+            return None, 0.0
+        degree = min(degree, len(x_vals) - 1)
+        if degree < 0:
+            return None, 0.0
+        vandermonde = np.vander(x_vals, N=degree + 1, increasing=True)
+        coeffs, *_ = np.linalg.lstsq(vandermonde, y_vals, rcond=None)
+        residuals = y_vals - vandermonde.dot(coeffs)
+        rms = float(np.sqrt(np.mean(residuals ** 2))) if len(residuals) else 0.0
+        return coeffs.tolist(), rms
+
+    def evaluate_polynomial(self, tab_key: str, header: str, alpha_value: float) -> Optional[float]:
+        if self.alpha0 is None:
+            return None
+        models_for_tab = self.polynomial_models.get(tab_key)
+        if not models_for_tab:
+            return None
+        model = models_for_tab.get(header)
+        if not model:
+            return None
+        x = alpha_value - self.alpha0
+        result = 0.0
+        for idx, coeff in enumerate(model["coeffs"]):
+            result += coeff * (x ** idx)
+        return result
+
+    def generate_idb_file(self) -> None:
+        if not self.loaded_lst_name or not self.loaded_base_path:
+            messagebox.showerror("Generate IDB", "Load an .LST file before generating an IDB.")
+            return
+        if not self.loaded_alpha_pairs:
+            messagebox.showerror("Generate IDB", "No alpha entries available.")
+            return
+        if self.alpha0 is None:
+            messagebox.showerror("Generate IDB", "Unable to determine ALPHA0.")
+            return
+        if self.idbkode is None:
+            messagebox.showerror("Generate IDB", "IDBKODE not found in the .LST file.")
+            return
+        self.update_polynomial_models()
+        sections: List[Tuple[str, TabConfig]] = []
+        for tab_key in ("EPS", "MUS"):
+            extension = self.tab_extensions.get(tab_key)
+            if extension:
+                sections.append((tab_key, self.tabs[tab_key].config))
+        if not sections:
+            messagebox.showerror("Generate IDB", "No CEPS or CMU data available to generate an IDB file.")
+            return
+        for tab_key, config in sections:
+            models = self.polynomial_models.get(tab_key, {})
+            for header in config.polynomial_headers:
+                if header not in models:
+                    messagebox.showerror(
+                        "Generate IDB",
+                        f"Polynomial for {tab_key} parameter {header} is not defined. Adjust PWR values and try again.",
+                    )
+                    return
+        timestamp = datetime.now().strftime("%d-%b-%Y %H:%M:%S")
+        idb_path = self.loaded_base_path / Path(self.loaded_lst_name).with_suffix(".IDB").name
+        lines: List[str] = [
+            f"! Generated by MaterialGui on {timestamp}",
+            f"! Source LST: {self.loaded_lst_name}",
+            "",
+            f"  {self.alpha0: .7E}  {self.idbkode}",
+            "",
+        ]
+        for tab_key, config in sections:
+            lines.append(f"! {config.notebook_label} parameters ({self.tab_extensions.get(tab_key)})")
+            models = self.polynomial_models.get(tab_key, {})
+            for header in config.polynomial_headers:
+                model = models[header]
+                lines.append(f"  {model['power']}")
+                coeff_line = "  " + " ".join(f"{coeff: .7E}" for coeff in model["coeffs"])
+                lines.append(coeff_line)
+                lines.append("")
+        try:
+            idb_path.write_text("\n".join(lines).rstrip() + "\n")
+        except OSError as exc:
+            messagebox.showerror("Generate IDB", f"Unable to write {idb_path.name}: {exc}")
+            return
+        self.set_status(f"Generated {idb_path.name}")
+
+    @staticmethod
+    def _safe_float(value: str) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _normalize_header(text: str) -> str:
+        return text.replace("▶", "").replace("•", "").strip()
+
+    @staticmethod
+    def normalize_alpha(value: Any) -> str:
+        try:
+            numeric = float(value)
+            return f"{numeric:.4f}"
+        except (TypeError, ValueError):
+            return str(value).strip()
+
+    @staticmethod
+    def _format_value(value: Optional[float]) -> str:
+        if value is None:
+            return ""
+        return f"{value:.6g}"
+
+    def _measurement_path_for_stem(self, stem: str, base_path: Path) -> Optional[Path]:
+        candidates = [".ROP", ".rop", ".EMU", ".emu"]
+        for extension in candidates:
+            path = self.resolve_stem(stem, base_path, extension)
+            if path.exists():
+                return path
+        return None
+
+    def generate_initial_fits(self) -> None:
+        if not self.loaded_alpha_pairs or not self.loaded_base_path:
+            messagebox.showerror("Generate Fits", "Load an .LST file before running fits.")
+            return
+        errors: List[str] = []
+        total_success = 0
+        for tab_key in ("EPS", "MUS"):
+            total_success += self.run_tab_fits(
+                tab_key,
+                silent=True,
+                error_list=errors,
+                reload=False,
+            )
+        if total_success:
+            missing = self.populate_tables(self.loaded_alpha_pairs, self.loaded_base_path)
+            if missing:
+                errors.extend(f"{name}: could not reload" for name in missing)
+            if self.loaded_lst_path:
+                self.load_lsf_data(self.loaded_lst_path)
+            self.update_plots()
+            self.update_summary_tables()
+            self.update_highlights()
+            self.update_polynomial_models()
+            for key in self.tabs:
+                self.refresh_ini_table(key)
+            self.set_status("Generated initial DBE/2LM files from measurement data.")
+        if errors:
+            messagebox.showerror(
+                "Generate Fits",
+                "\n".join(errors[:10]) + ("\n..." if len(errors) > 10 else ""),
+            )
+
+    def _build_debye_controls(self, alpha_key: str) -> DebyeControls:
+        block = self.parameter_blocks.get("EPS", {}).get(alpha_key)
+        if not block:
+            return DebyeControls()
+        values = self._block_to_dict(block)
+        return DebyeControls(
+            fres=self._parse_float(self._value_for_keys(values, "FRES0")),
+            deps=self._parse_float(self._value_for_keys(values, "DEPS0")),
+            epsv=self._parse_float(self._value_for_keys(values, "EPSV0")),
+            gamma=self._parse_float(self._value_for_keys(values, "GAMMA0", "GAMM0")),
+            sige=self._parse_float(self._value_for_keys(values, "SIGE0")),
+        )
+
+    def _build_double_lorentz_controls(self, alpha_key: str) -> DoubleLorentzControls:
+        block = self.parameter_blocks.get("MUS", {}).get(alpha_key)
+        if not block:
+            return DoubleLorentzControls()
+        values = self._block_to_dict(block)
+        return DoubleLorentzControls(
+            fres1=self._parse_float(self._value_for_keys(values, "FR_M01", "FR_M0D")),
+            deps1=self._parse_float(self._value_for_keys(values, "DMUR01", "DMUR0D")),
+            gamma1=self._parse_float(self._value_for_keys(values, "GAMM01", "GAMM0D")),
+            fres2=self._parse_float(self._value_for_keys(values, "FR_M02", "FR_M0L")),
+            deps2=self._parse_float(self._value_for_keys(values, "DMUR02", "DMUR0L")),
+            gamma2=self._parse_float(self._value_for_keys(values, "GAMM02", "GAMM0L")),
+            epsv=self._parse_float(self._value_for_keys(values, "MURV0")),
+            sige=self._parse_float(self._value_for_keys(values, "SIGM0", "SIGE0")),
+        )
+
+    def _block_to_dict(self, block: ParameterBlock) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        for header, value in zip(block.headers, block.values):
+            normalized = self._normalize_param_name(header)
+            mapping[normalized] = value
+        return mapping
+
+    def _normalize_param_name(self, header: str) -> str:
+        normalized = header.strip().upper().replace("Δ", "D")
+        normalized = normalized.replace("Â", "A")
+        normalized = normalized.replace("4MUR", "DMUR")
+        normalized = normalized.replace(" ", "")
+        return normalized
+
+    def _parse_float(self, value: Optional[str]) -> float:
+        if value is None:
+            return 0.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _value_for_keys(values: Dict[str, str], *keys: str) -> Optional[str]:
+        for key in keys:
+            if key in values:
+                return values[key]
+        return None
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    MaterialGui().run()
