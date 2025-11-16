@@ -32,14 +32,56 @@ def _extract_parameter_mapping(path: Path, marker: str) -> Optional[Dict[str, st
         return None
     for idx, line in enumerate(lines):
         if marker in line:
-            if idx + 2 >= len(lines):
+            header_index = _find_table_header_index(lines, idx + 1)
+            if header_index is None:
                 return None
-            header_tokens = [token.upper() for token in lines[idx + 1].split()]
-            data_tokens = lines[idx + 2].split()
+            value_index = _find_numeric_line_index(lines, header_index + 1)
+            if value_index is None:
+                return None
+            header_tokens = [token.upper() for token in lines[header_index].split()]
+            data_tokens = lines[value_index].split()
             if len(data_tokens) < len(header_tokens):
                 return None
             return dict(zip(header_tokens, data_tokens))
     return None
+
+
+def _find_table_header_index(lines: List[str], start: int) -> Optional[int]:
+    for idx in range(start, len(lines)):
+        stripped = lines[idx].strip()
+        if not stripped:
+            continue
+        if stripped[0] in "=<>":
+            continue
+        if stripped.upper().startswith("TO FIX"):
+            continue
+        tokens = stripped.split()
+        if tokens and all(_token_has_letter(token) for token in tokens):
+            return idx
+    return None
+
+
+def _find_numeric_line_index(lines: List[str], start: int) -> Optional[int]:
+    for idx in range(start, len(lines)):
+        tokens = lines[idx].split()
+        if not tokens:
+            continue
+        if all(_is_numeric_token(token) for token in tokens):
+            return idx
+    return None
+
+
+def _token_has_letter(token: str) -> bool:
+    return any(ch.isalpha() for ch in token)
+
+
+def _is_numeric_token(token: str) -> bool:
+    cleaned = token.rstrip(",;")
+    try:
+        float(cleaned)
+        return True
+    except ValueError:
+        return False
 
 
 def parse_dbe_file(path: Path) -> Optional[Dict[str, str]]:
@@ -71,6 +113,7 @@ class TabConfig:
     polynomial_headers: Tuple[str, ...]
     ini_mapping: Dict[str, Any]
     value_aliases: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    monotonic_constraints: Dict[str, str] = field(default_factory=dict)
 
     @property
     def stem_header(self) -> str:
@@ -126,6 +169,32 @@ class ParameterEditorRow:
     preview_label: ttk.Label
 
 
+class Tooltip:
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self.tipwindow: Optional[tk.Toplevel] = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+        widget.bind("<FocusOut>", self._hide)
+
+    def _show(self, _event=None) -> None:
+        if self.tipwindow or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        self.tipwindow = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(tw, text=self.text, background="#ffffe0", relief="solid", borderwidth=1)
+        label.pack(padx=4, pady=2)
+
+    def _hide(self, _event=None) -> None:
+        if self.tipwindow is not None:
+            self.tipwindow.destroy()
+            self.tipwindow = None
+
+
 TAB_CONFIGS: Tuple[TabConfig, ...] = (
     TabConfig(
         key="EPS",
@@ -143,6 +212,13 @@ TAB_CONFIGS: Tuple[TabConfig, ...] = (
             "GAMMA": "GAMM0",
             "SIGE": "SIGE0",
         },
+        monotonic_constraints={
+            "FRES": "auto",
+            "DEPS": "auto",
+            "EPSV": "auto",
+            "GAMMA": "auto",
+            "SIGE": "auto",
+        },
     ),
     TabConfig(
         key="MUS",
@@ -150,21 +226,32 @@ TAB_CONFIGS: Tuple[TabConfig, ...] = (
         file_extension=".2LM",
         parser=parse_2lm_file,
         value_headers=("FR_M1", "DMUR1", "GAMM1", "FR_M2", "DMUR2",
-                       "GAMM2", "MURV", "SIGM", "RMS"),
+                       "GAMM2", "MURV", "EPSV", "RMS"),
         small_headers=("FR_M1", "DMUR1", "GAMM1", "FR_M2", "DMUR2",
-                       "GAMM2", "MURV", "SIGM"),
+                       "GAMM2", "MURV", "EPSV"),
         plot_color="#0275d8",
         polynomial_headers=("FR_M1", "DMUR1", "GAMM1", "FR_M2", "DMUR2",
-                            "GAMM2", "MURV", "SIGM"),
+                            "GAMM2", "MURV", "EPSV"),
         ini_mapping={
-            "FR_M1": "FR_M01",
-            "DMUR1": "DMUR01",
-            "GAMM1": "GAMM01",
-            "FR_M2": "FR_M02",
-            "DMUR2": "DMUR02",
-            "GAMM2": "GAMM02",
+            "FR_M1": ("FR_M01", "FR_M0D"),
+            "DMUR1": ("DMUR01", "DMUR0D"),
+            "GAMM1": ("GAMM01", "GAMM0D"),
+            "FR_M2": ("FR_M02", "FR_M0L"),
+            "DMUR2": ("DMUR02", "DMUR0L", "4MUR02"),
+            "GAMM2": ("GAMM02", "GAMM0L"),
             "MURV": "MURV0",
-            "SIGM": "SIGM0",
+            "EPSV": "SIGM0",
+        },
+        value_aliases={"EPSV": ("SIGM",)},
+        monotonic_constraints={
+            "FR_M1": "auto",
+            "DMUR1": "auto",
+            "GAMM1": "auto",
+            "FR_M2": "auto",
+            "DMUR2": "auto",
+            "GAMM2": "auto",
+            "MURV": "auto",
+            "EPSV": "auto",
         },
     ),
 )
@@ -175,6 +262,16 @@ class MaterialGui:
         ("estimate", "Let computer estimate (0)"),
         ("fix", "Keep parameter fixed (>0)"),
         ("negative", "Use negative initial guess (<0)"),
+    )
+    INI_TREND_DEVIATION_TAG = "ini-trend-deviation"
+    INI_TREND_COLOR = "#fdecea"
+    INI_TREND_MOVING_RADIUS = 1
+    INI_TREND_ARROW_MAP = {"up": "↑", "down": "↓", "flat": "→"}
+    INI_ADJUSTMENT_PRESETS: Tuple[Tuple[str, float], ...] = (
+        ("-10%", -0.10),
+        ("-5%", -0.05),
+        ("+5%", 0.05),
+        ("+10%", 0.10),
     )
 
     def __init__(self) -> None:
@@ -209,6 +306,9 @@ class MaterialGui:
         self.diagnostics_axes_real = None
         self.diagnostics_axes_imag = None
         self.diagnostics_canvas: Optional[FigureCanvasTkAgg] = None
+        self.notebook: Optional[ttk.Notebook] = None
+        self.tab_frame_to_key: Dict[tk.Widget, str] = {}
+        self._tooltips: List[Tooltip] = []
         self._build_style()
         self._build_header()
         self._build_notebook()
@@ -228,24 +328,48 @@ class MaterialGui:
             foreground=[("selected", base_fg)],
         )
 
+    def _add_tooltip(self, widget: tk.Widget, text: str) -> None:
+        if not text:
+            return
+        tooltip = Tooltip(widget, text)
+        self._tooltips.append(tooltip)
+
     def _build_header(self) -> None:
         header = ttk.Frame(self.root)
         header.pack(fill="x", padx=10, pady=5)
-        ttk.Button(header, text="Load .LST File", command=self.load_lst_file).pack(side=tk.LEFT)
-        ttk.Button(header, text="Edit .LST", command=self.open_lst_editor).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(header, text="Generate Initial Fits", command=self.generate_initial_fits).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(header, text="Generate IDB", command=self.generate_idb_file).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(header, text="Restore Originals", command=self.restore_original_files).pack(side=tk.LEFT, padx=(8, 0))
+        load_btn = ttk.Button(header, text="Load .LST File", command=self.load_lst_file)
+        load_btn.pack(side=tk.LEFT)
+        self._add_tooltip(load_btn, "Load an .LST file to populate the parameter tables.")
+        edit_btn = ttk.Button(header, text="Edit .LST", command=self.open_lst_editor)
+        edit_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._add_tooltip(edit_btn, "Open a dialog to edit alpha/stem entries in the current .LST file.")
+        init_btn = ttk.Button(header, text="Generate Initial Fits", command=self.generate_initial_fits)
+        init_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._add_tooltip(init_btn, "Create DBE/2LM files from raw ROP/EMU measurements for all entries.")
+        run_btn = ttk.Button(header, text="Run Fits", command=self.run_selected_tab_fits)
+        run_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._add_tooltip(run_btn, "Re-run fits for the currently selected tab using current INI seeds.")
+        idb_btn = ttk.Button(header, text="Generate IDB", command=self.generate_idb_file)
+        idb_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._add_tooltip(idb_btn, "Build an IDB file from the latest polynomial models.")
+        restore_btn = ttk.Button(header, text="Restore Originals", command=self.restore_original_files)
+        restore_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._add_tooltip(restore_btn, "Copy files back from the last snapshot created when loading data.")
+        auto_btn = ttk.Button(header, text="Auto Converge", command=self.auto_converge)
+        auto_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._add_tooltip(auto_btn, "Adjust INI parameters automatically in an attempt to converge fits.")
         ttk.Label(header, textvariable=self.status_var, style="Status.TLabel").pack(side=tk.LEFT, padx=12)
 
     def _build_notebook(self) -> None:
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True)
+        self.notebook = notebook
         for config in TAB_CONFIGS:
             frame = ttk.Frame(notebook)
             notebook.add(frame, text=config.notebook_label)
             state = self._build_tab(frame, config)
             self.tabs[config.key] = state
+            self.tab_frame_to_key[frame] = config.key
         self._build_diagnostics_tab(notebook)
 
     def _build_tab(self, container: ttk.Frame, config: TabConfig) -> TabState:
@@ -292,30 +416,49 @@ class MaterialGui:
 
         button_row = ttk.Frame(control_frame)
         button_row.pack(fill="x", pady=(0, 4))
-        ttk.Button(
+        inc_btn = ttk.Button(
             button_row,
             text="Increase PWR",
             command=lambda key=config.key: self.adjust_power(key, 1),
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(
+        )
+        inc_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self._add_tooltip(inc_btn, "Raise the polynomial fit order for the highlighted column.")
+        dec_btn = ttk.Button(
             button_row,
             text="Decrease PWR",
             command=lambda key=config.key: self.adjust_power(key, -1),
-        ).pack(side=tk.LEFT)
-        ttk.Button(
-            button_row,
-            text="Run Fits",
-            command=lambda key=config.key: self.run_tab_fits(key),
-        ).pack(side=tk.LEFT, padx=(12, 0))
-
+        )
+        dec_btn.pack(side=tk.LEFT)
+        self._add_tooltip(dec_btn, "Lower the polynomial fit order for the highlighted column.")
         ini_section = ttk.LabelFrame(control_frame, text="INI Parameter Controls")
         ini_section.pack(fill="both", expand=False, pady=(4, 0))
         ini_label_var = tk.StringVar(value="Select a column to edit its INI parameters.")
         ini_label = ttk.Label(ini_section, textvariable=ini_label_var, anchor="w")
         ini_label.pack(fill="x", padx=4, pady=(4, 2))
+        preset_frame = ttk.Frame(ini_section)
+        preset_frame.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Label(preset_frame, text="Guided adjustments:").pack(side=tk.LEFT)
+        for preset_label, preset_value in self.INI_ADJUSTMENT_PRESETS:
+            btn = ttk.Button(
+                preset_frame,
+                text=preset_label,
+                command=lambda v=preset_value, lbl=preset_label, key=config.key: self.apply_ini_preset(key, v, lbl),
+            )
+            btn.pack(side=tk.LEFT, padx=2)
+            self._add_tooltip(btn, f"Apply a {preset_label} change to the selected INI row.")
+        update_btn = ttk.Button(
+            preset_frame,
+            text="Update Parameter",
+            command=lambda key=config.key: self.update_selected_parameter(key),
+        )
+        update_btn.pack(side=tk.RIGHT)
+        self._add_tooltip(
+            update_btn,
+            "Seed monotonic guesses (if enabled) and re-run fits for this column's files.",
+        )
         ini_tree = ttk.Treeview(
             ini_section,
-            columns=("FILE", "ALPHA", "PARAM", "MODE", "VALUE", "FINAL"),
+            columns=("FILE", "ALPHA", "PARAM", "MODE", "VALUE", "FINAL", "TREND"),
             show="headings",
             selectmode="browse",
             height=len(config.small_headers) * 2,
@@ -326,33 +469,50 @@ class MaterialGui:
         ini_tree.heading("MODE", text="Mode")
         ini_tree.heading("VALUE", text="Magnitude")
         ini_tree.heading("FINAL", text="Applied")
+        ini_tree.heading("TREND", text="Trend")
         ini_tree.column("FILE", width=140, anchor="w")
         ini_tree.column("ALPHA", width=80, anchor="center")
         ini_tree.column("PARAM", width=110, anchor="center")
         ini_tree.column("MODE", width=160, anchor="center")
         ini_tree.column("VALUE", width=100, anchor="center")
         ini_tree.column("FINAL", width=100, anchor="center")
+        ini_tree.column("TREND", width=70, anchor="center")
         ini_tree.pack(fill="both", expand=False, padx=4, pady=(0, 4))
+        ini_tree.tag_configure(self.INI_TREND_DEVIATION_TAG, background=self.INI_TREND_COLOR)
         ini_tree.bind("<Double-1>", lambda event, key=config.key: self.start_ini_edit(key, event))
 
         # Large table
         large_frame = ttk.Frame(bottom_split)
         bottom_split.add(large_frame, weight=3)
+        large_tree_container = ttk.Frame(large_frame)
+        large_tree_container.pack(fill="both", expand=True)
+        large_tree_scroll_x = ttk.Scrollbar(large_tree_container, orient="horizontal")
+        large_tree_scroll_x.pack(fill="x", side=tk.BOTTOM)
         large_tree = ttk.Treeview(
-            large_frame,
+            large_tree_container,
             columns=config.large_headers,
             show="headings",
             selectmode="browse",
+            xscrollcommand=large_tree_scroll_x.set,
         )
+        large_tree_scroll_x.config(command=large_tree.xview)
         for header in config.large_headers:
             large_tree.heading(header, text=header)
             large_tree.column(header, width=120, anchor="center", stretch=True)
         large_tree.pack(fill="both", expand=True)
+        large_tree.bind(
+            "<Configure>",
+            lambda event, tree=large_tree: self._autosize_tree_columns(tree, min_width=90),
+        )
         large_tree.bind("<Button-1>", lambda event, key=config.key: self.handle_column_click(event, key))
 
         # Summary
         summary_frame = ttk.Frame(bottom_split)
         bottom_split.add(summary_frame, weight=2)
+        summary_tree_container = ttk.Frame(summary_frame)
+        summary_tree_container.pack(fill="both", expand=True)
+        summary_tree_scroll_x = ttk.Scrollbar(summary_tree_container, orient="horizontal")
+        summary_tree_scroll_x.pack(fill="x", side=tk.BOTTOM)
         summary_label = ttk.Label(
             summary_frame,
             text='LSF / IDB / Δ VALUES OF "COLUMN" AT SPECIFIED ALPHAS',
@@ -360,15 +520,21 @@ class MaterialGui:
         )
         summary_label.pack(fill="x")
         summary_tree = ttk.Treeview(
-            summary_frame,
+            summary_tree_container,
             columns=("ALPHA", "LSF", "IDB", "DELTA"),
             show="headings",
             height=8,
+            xscrollcommand=summary_tree_scroll_x.set,
         )
+        summary_tree_scroll_x.config(command=summary_tree.xview)
         for column in ("ALPHA", "LSF", "IDB", "DELTA"):
             summary_tree.heading(column, text=column)
             summary_tree.column(column, width=110, anchor="center")
         summary_tree.pack(fill="both", expand=True)
+        summary_tree.bind(
+            "<Configure>",
+            lambda event, tree=summary_tree: self._autosize_tree_columns(tree, min_width=80),
+        )
 
         column_index = {header: idx for idx, header in enumerate(config.large_headers)}
         return TabState(
@@ -731,6 +897,7 @@ class MaterialGui:
             return
         state.ini_label_var.set(f"{selection.header} controls for all files.")
         sorted_alphas = sorted(blocks.keys(), key=lambda a: self._safe_float(a))
+        row_entries: List[Dict[str, Any]] = []
         for alpha_key in sorted_alphas:
             block = blocks[alpha_key]
             candidates = (param_header,) if isinstance(param_header, str) else tuple(param_header)
@@ -743,11 +910,42 @@ class MaterialGui:
             mode_label = self._control_label(mode)
             magnitude = self._entry_value_for_mode(value, mode)
             final_value = self._preview_value_for_mode(mode, magnitude, value) or value
-            file_name = self.alpha_to_files.get(tab_key, {}).get(alpha_key, "")
+            file_name = block.path.name if isinstance(block.path, Path) else str(block.path)
+            row_entries.append(
+                {
+                    "file": file_name,
+                    "alpha": alpha_key,
+                    "param": header_name,
+                    "mode": mode_label,
+                    "magnitude": magnitude,
+                    "final": final_value,
+                    "numeric": self._try_parse_numeric(final_value),
+                }
+            )
+        if not row_entries:
+            return
+        numeric_values = [entry["numeric"] for entry in row_entries]
+        moving_average = self._moving_average_sequence(numeric_values, self.INI_TREND_MOVING_RADIUS)
+        tolerance = self._trend_tolerance(numeric_values)
+        for idx, entry in enumerate(row_entries):
+            direction = self._moving_average_direction(moving_average, idx, tolerance)
+            arrow = self.INI_TREND_ARROW_MAP.get(direction, "")
+            tags = ()
+            if self._is_trend_deviation(direction, numeric_values, idx, tolerance):
+                tags = (self.INI_TREND_DEVIATION_TAG,)
             tree.insert(
                 "",
                 "end",
-                values=(file_name, alpha_key, param_header, mode_label, magnitude, final_value),
+                values=(
+                    entry["file"],
+                    entry["alpha"],
+                    entry["param"],
+                    entry["mode"],
+                    entry["magnitude"],
+                    entry["final"],
+                    arrow,
+                ),
+                tags=tags,
             )
 
     def start_ini_edit(self, tab_key: str, event: tk.Event) -> None:
@@ -796,7 +994,7 @@ class MaterialGui:
                 combo.focus()
 
         combo.bind("<<ComboboxSelected>>", commit)
-        combo.bind("<FocusOut>", commit)
+        combo.bind("<FocusOut>", lambda _e: self.close_ini_editor(tab_key))
         combo.bind("<Escape>", lambda _e: self.close_ini_editor(tab_key))
         self.ini_inline_widgets[tab_key] = combo
 
@@ -829,7 +1027,7 @@ class MaterialGui:
                 entry.focus()
 
         entry.bind("<Return>", commit)
-        entry.bind("<FocusOut>", commit)
+        entry.bind("<FocusOut>", lambda _event: self.close_ini_editor(tab_key))
         entry.bind("<Escape>", lambda _event: self.close_ini_editor(tab_key))
         self.ini_inline_widgets[tab_key] = entry
 
@@ -864,6 +1062,46 @@ class MaterialGui:
             return False
         block.values[index] = formatted
         return self.apply_ini_changes(block, block.values)
+
+    def apply_ini_preset(self, tab_key: str, percent: float, label: str) -> None:
+        selection = self.selection
+        if not selection or selection.tab_key != tab_key:
+            messagebox.showinfo("Guided Adjustment", "Select a parameter column first.")
+            return
+        state = self.tabs[tab_key]
+        tree = state.ini_tree
+        self.close_ini_editor(tab_key)
+        row_ids = tree.selection()
+        if not row_ids:
+            messagebox.showinfo("Guided Adjustment", "Select an INI row to adjust.")
+            return
+        row_id = row_ids[0]
+        alpha_key = tree.set(row_id, "ALPHA")
+        parameter = tree.set(row_id, "PARAM")
+        mode_label = tree.set(row_id, "MODE")
+        final_text = tree.set(row_id, "FINAL")
+        if not alpha_key or not parameter:
+            messagebox.showerror("Guided Adjustment", "Row is missing alpha or parameter information.")
+            return
+        final_value = self._try_parse_numeric(final_text)
+        if final_value is None:
+            messagebox.showerror("Guided Adjustment", "Unable to adjust non-numeric parameter values.")
+            return
+        mode_code = self._mode_from_label(mode_label)
+        if mode_code == "estimate":
+            messagebox.showinfo("Guided Adjustment", "Set this parameter to Fix or Negative before applying presets.")
+            return
+        change_factor = 1.0 + percent
+        new_value = final_value * change_factor
+        magnitude_value = abs(new_value)
+        if magnitude_value <= 0:
+            messagebox.showerror("Guided Adjustment", "Adjustment would zero-out this parameter. Choose a smaller change.")
+            return
+        magnitude_text = self._format_value(magnitude_value)
+        if not magnitude_text.strip():
+            magnitude_text = str(magnitude_value)
+        if self.commit_ini_change(tab_key, alpha_key, parameter, mode_label, magnitude_text):
+            self.set_status(f"Applied {label} preset to {parameter} at alpha {alpha_key}.")
 
     def adjust_power(self, tab_key: str, delta: int) -> None:
         if not self.selection or self.selection.tab_key != tab_key:
@@ -1130,19 +1368,23 @@ class MaterialGui:
         window.transient(self.root)
         window.focus_set()
 
-    def apply_ini_changes(self, block: ParameterBlock, values: List[str]) -> bool:
+    def apply_ini_changes(self, block: ParameterBlock, values: List[str], *, reload_data: bool = True) -> bool:
         if len(values) != len(block.headers):
             messagebox.showerror("Change INI", "Parameter count mismatch.")
             return False
         lines = list(block.lines)
         template = lines[block.value_index] if block.value_index < len(lines) else ""
-        lines[block.value_index] = self._format_ini_line(template, values)
+        new_line = self._format_ini_line(template, values)
+        lines[block.value_index] = new_line
         try:
             block.path.write_text("\n".join(lines) + "\n")
         except OSError as exc:
             messagebox.showerror("Change INI", f"Unable to save changes: {exc}")
             return False
-        self.reload_after_ini_change(block.path)
+        block.lines = lines
+        block.values = list(values)
+        if reload_data:
+            self.reload_after_ini_change(block.path)
         return True
 
     def _format_ini_line(self, template: str, values: List[str]) -> str:
@@ -1251,12 +1493,35 @@ class MaterialGui:
             for key in self.tabs:
                 self.refresh_ini_table(key)
 
+    def run_selected_tab_fits(self) -> None:
+        if not self.notebook:
+            return
+        tab_id = self.notebook.select()
+        if not tab_id:
+            messagebox.showinfo("Run Fits", "Select a data tab before running fits.")
+            return
+        widget = self.root.nametowidget(tab_id)
+        tab_key = self.tab_frame_to_key.get(widget)
+        if not tab_key:
+            messagebox.showinfo("Run Fits", "Select the EPS_DEBYE or MUS_DL tab, then try again.")
+            return
+        errors: List[str] = []
+        successes = self.run_tab_fits(tab_key, silent=False, error_list=errors, reload=True, selected_pairs=None)
+        if successes:
+            self.set_status(f"[{tab_key}] Completed fits for {successes} file(s).")
+        if errors:
+            messagebox.showerror(
+                "Run Fits",
+                "\n".join(errors[:10]) + ("\n..." if len(errors) > 10 else ""),
+            )
+
     def run_tab_fits(
         self,
         tab_key: str,
         silent: bool = False,
         error_list: Optional[List[str]] = None,
         reload: bool = True,
+        selected_pairs: Optional[List[Tuple[str, str]]] = None,
     ) -> int:
         if not self.loaded_alpha_pairs or not self.loaded_base_path:
             if not silent:
@@ -1266,7 +1531,8 @@ class MaterialGui:
         total = len(self.loaded_alpha_pairs)
         successes = 0
         local_errors: List[str] = []
-        for idx, (alpha_text, stem) in enumerate(self.loaded_alpha_pairs, start=1):
+        target_pairs = selected_pairs if selected_pairs else self.loaded_alpha_pairs
+        for idx, (alpha_text, stem) in enumerate(target_pairs, start=1):
             alpha_key = self.normalize_alpha(alpha_text)
             measurement_path = self._measurement_path_for_stem(stem, self.loaded_base_path)
             if not measurement_path:
@@ -1683,6 +1949,123 @@ class MaterialGui:
         for state in self.tabs.values():
             self._update_summary_for_state(state)
 
+    def _adjust_controls_for_attempt(self, controls: DebyeControls, attempt: int) -> DebyeControls:
+        scale = 1 + (attempt * 0.1)
+        return DebyeControls(
+            fres=controls.fres * scale if controls.fres else 0.0,
+            deps=controls.deps * scale if controls.deps else 0.0,
+            epsv=controls.epsv,
+            gamma=controls.gamma + attempt * 0.05,
+            sige=controls.sige,
+        )
+
+    def _adjust_dl_controls_for_attempt(self, controls: DoubleLorentzControls, attempt: int) -> DoubleLorentzControls:
+        scale = 1 + (attempt * 0.1)
+        return DoubleLorentzControls(
+            fres1=controls.fres1 * scale if controls.fres1 else 0.0,
+            deps1=controls.deps1 * scale if controls.deps1 else 0.0,
+            gamma1=controls.gamma1 + attempt * 0.05,
+            fres2=controls.fres2 * scale if controls.fres2 else 0.0,
+            deps2=controls.deps2 * scale if controls.deps2 else 0.0,
+            gamma2=controls.gamma2 + attempt * 0.05,
+            epsv=controls.epsv,
+            sige=controls.sige,
+        )
+
+    def auto_converge(self) -> None:
+        if not self.loaded_alpha_pairs or not self.loaded_base_path:
+            messagebox.showerror("Auto Converge", "Load an .LST file and associated .ROP files first.")
+            return
+        errors: List[str] = []
+        successes = 0
+        for tab_key in ("EPS", "MUS"):
+            output_map = self.alpha_file_paths.setdefault(tab_key, {})
+
+            state = self.tabs.get(tab_key)
+            if not state:
+                continue
+            for alpha_text, stem in self.loaded_alpha_pairs:
+                alpha_key = self.normalize_alpha(alpha_text)
+                measurement_path = self._measurement_path_for_stem(stem, self.loaded_base_path)
+                if not measurement_path:
+                    errors.append(f"{stem}: measurement (.ROP/.EMU) not found")
+                    continue
+                block = self.parameter_blocks.get(tab_key, {}).get(alpha_key)
+                try:
+                    rop_data = read_material_file(measurement_path)
+                except Exception as exc:
+                    errors.append(f"{stem}: unable to read measurement data: {exc}")
+                    continue
+                for attempt in range(5):
+                    if tab_key == "EPS":
+                        controls = self._build_debye_controls(alpha_key)
+                        controls = self._adjust_controls_for_attempt(controls, attempt)
+                        result = fit_debye(rop_data, controls)
+                        report = generate_dbe_report(
+                            rop_data,
+                            controls,
+                            result,
+                            input_file=measurement_path,
+                            output_file=self.alpha_file_paths.get(tab_key, {}).get(alpha_key, measurement_path.with_suffix(".DBE")),
+                        )
+                    else:
+                        controls = self._build_double_lorentz_controls(alpha_key)
+                        controls = self._adjust_dl_controls_for_attempt(controls, attempt)
+                        result = fit_double_lorentz(rop_data, "mu", controls)
+                        report = generate_dlm_report(
+                            rop_data,
+                            "mu",
+                            controls,
+                            result,
+                            input_file=measurement_path,
+                            output_file=self.alpha_file_paths.get(tab_key, {}).get(alpha_key, measurement_path.with_suffix(".2LM")),
+                        )
+                    output_path = self.alpha_file_paths.get(tab_key, {}).get(alpha_key)
+                    if not output_path:
+                        extension = self.tab_extensions.get(tab_key) or state.config.file_extension
+                        output_path = self.resolve_stem(stem, self.loaded_base_path, extension)
+                        self.alpha_file_paths.setdefault(tab_key, {})[alpha_key] = output_path
+                    try:
+                        output_path.write_text(report)
+                    except OSError as exc:
+                        errors.append(f"{output_path.name}: unable to write report ({exc})")
+                        break
+                    if result.iflag == 0:
+                        successes += 1
+                        break
+                    if attempt == 4:
+                        errors.append(f"{stem}: solver did not converge after multiple attempts")
+        missing = self.populate_tables(self.loaded_alpha_pairs, self.loaded_base_path)
+        if missing:
+            errors.extend(f"{name}: missing after auto converge" for name in missing)
+        if self.loaded_lst_path:
+            self.load_lsf_data(self.loaded_lst_path)
+        self.update_plots()
+        self.update_summary_tables()
+        self.update_highlights()
+        self.update_polynomial_models()
+        for key in self.tabs:
+            self.refresh_ini_table(key)
+        if successes:
+            self.set_status(f"Auto converge completed ({successes} fits updated).")
+        if errors:
+            messagebox.showerror(
+                "Auto Converge",
+                "\n".join(errors[:10]) + ("\n..." if len(errors) > 10 else ""),
+            )
+
+    @staticmethod
+    def _autosize_tree_columns(tree: ttk.Treeview, min_width: int = 80) -> None:
+        columns = tree["columns"]
+        if not columns:
+            return
+        total_width = tree.winfo_width()
+        if total_width <= 0:
+            return
+        width_per_column = max(min_width, total_width // len(columns))
+        for column in columns:
+            tree.column(column, width=width_per_column)
+
     def _update_summary_for_state(self, state: TabState) -> None:
         state.summary_tree.delete(*state.summary_tree.get_children())
         if not self.selection:
@@ -1873,6 +2256,152 @@ class MaterialGui:
             return 0.0
 
     @staticmethod
+    def _try_parse_numeric(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text.replace("D", "E").replace("d", "e")
+        try:
+            return float(normalized)
+        except ValueError:
+            return None
+
+    def _moving_average_sequence(
+        self,
+        values: List[Optional[float]],
+        radius: int,
+    ) -> List[Optional[float]]:
+        if radius <= 0:
+            return values[:]
+        averages: List[Optional[float]] = []
+        total = len(values)
+        for idx in range(total):
+            start = max(0, idx - radius)
+            end = min(total, idx + radius + 1)
+            window = [val for val in values[start:end] if val is not None]
+            averages.append(sum(window) / len(window) if window else None)
+        return averages
+
+    @staticmethod
+    def _neighbor_value(values: List[Optional[float]], start: int, step: int) -> Optional[float]:
+        idx = start
+        while 0 <= idx < len(values):
+            candidate = values[idx]
+            if candidate is not None:
+                return candidate
+            idx += step
+        return None
+
+    def _moving_average_direction(
+        self,
+        averages: List[Optional[float]],
+        index: int,
+        tolerance: float,
+    ) -> str:
+        if not averages:
+            return "flat"
+        current = averages[index]
+        if current is None:
+            return "flat"
+        prev_value = self._neighbor_value(averages, index - 1, -1)
+        next_value = self._neighbor_value(averages, index + 1, 1)
+        delta = 0.0
+        if prev_value is not None:
+            delta = current - prev_value
+        elif next_value is not None:
+            delta = next_value - current
+        if delta > tolerance:
+            return "up"
+        if delta < -tolerance:
+            return "down"
+        return "flat"
+
+    def _trend_tolerance(self, values: List[Optional[float]]) -> float:
+        numeric = [val for val in values if val is not None]
+        if not numeric:
+            return 0.0
+        scale = max(max(abs(val) for val in numeric), 1.0)
+        return max(scale * 1e-4, 1e-6)
+
+    def _is_trend_deviation(
+        self,
+        direction: str,
+        values: List[Optional[float]],
+        index: int,
+        tolerance: float,
+    ) -> bool:
+        if direction == "flat":
+            return False
+        current = values[index]
+        if current is None:
+            return False
+        prev_value = self._neighbor_value(values, index - 1, -1)
+        if prev_value is None:
+            return False
+        delta = current - prev_value
+        if direction == "up":
+            return delta < -tolerance
+        return delta > tolerance
+
+    def _resolve_monotonic_direction(
+        self,
+        config: TabConfig,
+        header: str,
+        values: List[Optional[float]],
+    ) -> str:
+        rule = config.monotonic_constraints.get(header, "").lower()
+        if not rule or rule in {"none", "off", "disabled"}:
+            return "flat"
+        if rule in {"increase", "increasing", "up", "+"}:
+            return "up"
+        if rule in {"decrease", "decreasing", "down", "-"}:
+            return "down"
+        return self._determine_monotonic_direction(values)
+
+    def _determine_monotonic_direction(self, values: List[Optional[float]]) -> str:
+        numeric = [value for value in values if value is not None]
+        if len(numeric) < 2:
+            return "flat"
+        tolerance = self._trend_tolerance(values)
+        diff = numeric[-1] - numeric[0]
+        if diff > tolerance:
+            return "up"
+        if diff < -tolerance:
+            return "down"
+        for prev, curr in zip(numeric, numeric[1:]):
+            delta = curr - prev
+            if delta > tolerance:
+                return "up"
+            if delta < -tolerance:
+                return "down"
+        return "flat"
+
+    def _enforce_monotonic_sequence(
+        self,
+        values: List[Optional[float]],
+        direction: str,
+    ) -> List[Optional[float]]:
+        if direction == "flat" or not values:
+            return values[:]
+        result: List[Optional[float]] = []
+        prev_value: Optional[float] = None
+        for value in values:
+            if value is None:
+                result.append(prev_value)
+                continue
+            if prev_value is None:
+                enforced = value
+            elif direction == "up":
+                enforced = max(value, prev_value)
+            else:
+                enforced = min(value, prev_value)
+            result.append(enforced)
+            prev_value = enforced
+        return result
+
+    @staticmethod
     def _normalize_header(text: str) -> str:
         return text.replace("▶", "").replace("•", "").strip()
 
@@ -1910,6 +2439,7 @@ class MaterialGui:
                 silent=True,
                 error_list=errors,
                 reload=False,
+                selected_pairs=None,
             )
         if total_success:
             missing = self.populate_tables(self.loaded_alpha_pairs, self.loaded_base_path)
@@ -1958,6 +2488,145 @@ class MaterialGui:
             epsv=self._parse_float(self._value_for_keys(values, "MURV0")),
             sige=self._parse_float(self._value_for_keys(values, "SIGM0", "SIGE0")),
         )
+
+    def _seed_monotonic_initial_guesses(self, tab_key: str, header: str) -> None:
+        state = self.tabs[tab_key]
+        config = state.config
+        mapping_entry = config.ini_mapping.get(header)
+        if not mapping_entry:
+            return
+        constraint_rule = config.monotonic_constraints.get(header, "")
+        if not constraint_rule or constraint_rule.lower() in {"none", "off", "disabled"}:
+            return
+        column_index = state.column_index.get(header)
+        if column_index is None:
+            return
+        blocks = self.parameter_blocks.get(tab_key, {})
+        entries: List[Dict[str, Any]] = []
+        for item in state.large_tree.get_children():
+            values = state.large_tree.item(item, "values")
+            if not values:
+                continue
+            alpha_text = values[0]
+            alpha_key = self.normalize_alpha(alpha_text)
+            if column_index >= len(values):
+                continue
+            numeric_value = self._try_parse_numeric(values[column_index])
+            if numeric_value is None:
+                continue
+            block = blocks.get(alpha_key)
+            if not block:
+                continue
+            candidates = (mapping_entry,) if isinstance(mapping_entry, str) else tuple(mapping_entry)
+            header_name = next((name for name in candidates if name in block.headers), None)
+            if not header_name:
+                continue
+            try:
+                idx = block.headers.index(header_name)
+            except ValueError:
+                continue
+            entries.append(
+                {
+                    "alpha_value": self._safe_float(alpha_text),
+                    "column_value": numeric_value,
+                    "block": block,
+                    "index": idx,
+                }
+            )
+        if len(entries) < 2:
+            return
+        entries.sort(key=lambda entry: entry["alpha_value"])
+        column_values = [entry["column_value"] for entry in entries]
+        direction = self._resolve_monotonic_direction(config, header, column_values)
+        if direction == "flat":
+            return
+        enforced_values = self._enforce_monotonic_sequence(column_values, direction)
+        tolerance = self._trend_tolerance(column_values)
+        updated_blocks: Dict[Path, ParameterBlock] = {}
+        updates = 0
+        for entry, seed_value in zip(entries, enforced_values):
+            if seed_value is None:
+                continue
+            block = entry["block"]
+            idx = entry["index"]
+            current_text = block.values[idx]
+            mode = self._infer_control_mode(current_text)
+            if mode != "negative":
+                continue
+            magnitude = abs(seed_value)
+            if magnitude <= 0:
+                continue
+            existing = self._try_parse_numeric(current_text)
+            if existing is not None and abs(abs(existing) - magnitude) <= tolerance:
+                continue
+            magnitude = max(magnitude, 1e-12)
+            magnitude_text = self._format_value(magnitude) or f"{magnitude:.6g}"
+            normalized = magnitude_text.strip().lstrip("+")
+            normalized = normalized.lstrip("-")
+            if not normalized or normalized in {"0", "0.0"}:
+                continue
+            formatted = f"-{normalized}"
+            if formatted == current_text:
+                continue
+            block.values[idx] = formatted
+            updated_blocks[block.path] = block
+            updates += 1
+        if not updated_blocks:
+            return
+        last_path: Optional[Path] = None
+        for block in updated_blocks.values():
+            last_path = block.path
+            if not self.apply_ini_changes(block, block.values, reload_data=False):
+                return
+        if last_path:
+            self.reload_after_ini_change(last_path)
+            direction_label = "increasing" if direction == "up" else "decreasing"
+            self.set_status(
+                f"Seeded {updates} monotonic initial guesses for {header} ({direction_label})."
+            )
+
+    def update_selected_parameter(self, tab_key: str) -> None:
+        selection = self.selection
+        if not selection or selection.tab_key != tab_key:
+            messagebox.showinfo("Update Parameter", "Select a parameter column first.")
+            return
+        self._seed_monotonic_initial_guesses(tab_key, selection.header)
+        state = self.tabs[tab_key]
+        config = state.config
+        mapping_entry = config.ini_mapping.get(selection.header)
+        if not mapping_entry:
+            messagebox.showerror("Update Parameter", f"No INI controls available for {selection.header}.")
+            return
+        parameter_label = selection.header
+        candidates = (mapping_entry,) if isinstance(mapping_entry, str) else tuple(mapping_entry)
+        pairs: List[Tuple[str, str]] = []
+        for item in state.ini_tree.get_children():
+            param_name = state.ini_tree.set(item, "PARAM")
+            if param_name not in candidates:
+                continue
+            alpha = state.ini_tree.set(item, "ALPHA")
+            file_name = state.ini_tree.set(item, "FILE")
+            if not alpha or not file_name:
+                continue
+            pairs.append((alpha, file_name))
+        if not pairs:
+            messagebox.showerror("Update Parameter", "No files found for the selected parameter.")
+            return
+        errors: List[str] = []
+        successes = self.run_tab_fits(
+            tab_key,
+            silent=False,
+            error_list=errors,
+            reload=True,
+            selected_pairs=pairs,
+        )
+        if successes:
+            self.set_status(f"[{tab_key}] Updated {parameter_label} for {successes} file(s).")
+        if errors:
+            messagebox.showerror(
+                "Update Parameter",
+                "\n".join(errors[:10]) + ("\n..." if len(errors) > 10 else ""),
+            )
 
     def _block_to_dict(self, block: ParameterBlock) -> Dict[str, str]:
         mapping: Dict[str, str] = {}
