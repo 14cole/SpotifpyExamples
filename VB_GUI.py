@@ -169,6 +169,14 @@ class ParameterEditorRow:
     preview_label: ttk.Label
 
 
+@dataclass
+class AutoConvergeSettings:
+    target_rms: float
+    max_iterations: int
+    convergence_factor: float
+    min_improvement: float
+
+
 class Tooltip:
     def __init__(self, widget: tk.Widget, text: str) -> None:
         self.widget = widget
@@ -357,7 +365,7 @@ class MaterialGui:
         self._add_tooltip(restore_btn, "Copy files back from the last snapshot created when loading data.")
         auto_btn = ttk.Button(header, text="Auto Converge", command=self.auto_converge)
         auto_btn.pack(side=tk.LEFT, padx=(8, 0))
-        self._add_tooltip(auto_btn, "Adjust INI parameters automatically in an attempt to converge fits.")
+        self._add_tooltip(auto_btn, "Iteratively adjust the selected column's INI seeds to reach a target RMS.")
         ttk.Label(header, textvariable=self.status_var, style="Status.TLabel").pack(side=tk.LEFT, padx=12)
 
     def _build_notebook(self) -> None:
@@ -1949,110 +1957,217 @@ class MaterialGui:
         for state in self.tabs.values():
             self._update_summary_for_state(state)
 
-    def _adjust_controls_for_attempt(self, controls: DebyeControls, attempt: int) -> DebyeControls:
-        scale = 1 + (attempt * 0.1)
-        return DebyeControls(
-            fres=controls.fres * scale if controls.fres else 0.0,
-            deps=controls.deps * scale if controls.deps else 0.0,
-            epsv=controls.epsv,
-            gamma=controls.gamma + attempt * 0.05,
-            sige=controls.sige,
-        )
-
-    def _adjust_dl_controls_for_attempt(self, controls: DoubleLorentzControls, attempt: int) -> DoubleLorentzControls:
-        scale = 1 + (attempt * 0.1)
-        return DoubleLorentzControls(
-            fres1=controls.fres1 * scale if controls.fres1 else 0.0,
-            deps1=controls.deps1 * scale if controls.deps1 else 0.0,
-            gamma1=controls.gamma1 + attempt * 0.05,
-            fres2=controls.fres2 * scale if controls.fres2 else 0.0,
-            deps2=controls.deps2 * scale if controls.deps2 else 0.0,
-            gamma2=controls.gamma2 + attempt * 0.05,
-            epsv=controls.epsv,
-            sige=controls.sige,
-        )
-
     def auto_converge(self) -> None:
         if not self.loaded_alpha_pairs or not self.loaded_base_path:
-            messagebox.showerror("Auto Converge", "Load an .LST file and associated .ROP files first.")
+            messagebox.showerror("Auto Converge", "Load an .LST file and associated measurement files first.")
             return
-        errors: List[str] = []
-        successes = 0
-        for tab_key in ("EPS", "MUS"):
-            output_map = self.alpha_file_paths.setdefault(tab_key, {})
+        if not self.selection:
+            messagebox.showinfo("Auto Converge", "Select a column to auto-converge.")
+            return
+        tab_key = self.selection.tab_key
+        settings = self._prompt_auto_converge_settings()
+        if not settings:
+            return
+        self._perform_auto_converge(tab_key, self.selection.header, settings)
 
-            state = self.tabs.get(tab_key)
-            if not state:
+    def _prompt_auto_converge_settings(self) -> Optional[AutoConvergeSettings]:
+        window = tk.Toplevel(self.root)
+        window.title("Auto Converge Settings")
+        ttk.Label(window, text="Target RMS").grid(row=0, column=0, sticky="e", padx=6, pady=4)
+        ttk.Label(window, text="Max Iterations").grid(row=1, column=0, sticky="e", padx=6, pady=4)
+        ttk.Label(window, text="Convergence Factor (0-1)").grid(row=2, column=0, sticky="e", padx=6, pady=4)
+        target_var = tk.StringVar(value="0.01")
+        iterations_var = tk.StringVar(value="5")
+        factor_var = tk.StringVar(value="0.35")
+        ttk.Entry(window, textvariable=target_var, width=12).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Entry(window, textvariable=iterations_var, width=12).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        ttk.Entry(window, textvariable=factor_var, width=12).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        result: Dict[str, Any] = {}
+
+        def submit() -> None:
+            try:
+                target = float(target_var.get())
+                max_iterations = int(iterations_var.get())
+                factor = float(factor_var.get())
+            except ValueError:
+                messagebox.showerror("Auto Converge", "Enter valid numeric values for all fields.")
+                return
+            if target <= 0 or max_iterations <= 0:
+                messagebox.showerror("Auto Converge", "Target RMS and iterations must be positive.")
+                return
+            factor = max(0.0, min(1.0, factor))
+            min_improvement = max(target * 0.05, 1e-4)
+            result["settings"] = AutoConvergeSettings(target, max_iterations, factor, min_improvement)
+            window.destroy()
+
+        def cancel() -> None:
+            window.destroy()
+
+        button_frame = ttk.Frame(window)
+        button_frame.grid(row=3, column=0, columnspan=2, pady=(6, 8))
+        ttk.Button(button_frame, text="Start", command=submit).pack(side=tk.LEFT, padx=4)
+        ttk.Button(button_frame, text="Cancel", command=cancel).pack(side=tk.LEFT, padx=4)
+        window.grab_set()
+        self.root.wait_window(window)
+        return result.get("settings")
+
+    def _perform_auto_converge(self, tab_key: str, header: str, settings: AutoConvergeSettings) -> None:
+        if not self._ensure_parameter_data(tab_key):
+            return
+        entries = self._gather_parameter_entries(tab_key, header)
+        if not entries:
+            messagebox.showerror("Auto Converge", f"No INI entries found for {header} in this tab.")
+            return
+        alpha_keys = [entry["alpha_key"] for entry in entries]
+        rms_value = self._compute_rms_statistic(tab_key, alpha_keys)
+        if rms_value is None:
+            messagebox.showerror("Auto Converge", "Unable to determine RMS values for this parameter.")
+            return
+        if rms_value <= settings.target_rms:
+            messagebox.showinfo(
+                "Auto Converge",
+                f"Current RMS ({rms_value:.4g}) already meets the target {settings.target_rms:.4g}.",
+            )
+            return
+        prev_rms = rms_value
+        iteration = 0
+        while iteration < settings.max_iterations:
+            iteration += 1
+            if not self._blend_ini_values_toward_targets(entries, settings.convergence_factor):
+                if iteration == 1:
+                    messagebox.showinfo("Auto Converge", "Unable to adjust INI entries for this column.")
+                break
+            self._seed_monotonic_initial_guesses(tab_key, header)
+            pairs = self._pairs_for_entries(tab_key, entries)
+            if not pairs:
+                messagebox.showerror("Auto Converge", "Unable to locate files for the selected parameter.")
+                return
+            errors: List[str] = []
+            successes = self.run_tab_fits(tab_key, silent=False, error_list=errors, reload=True, selected_pairs=pairs)
+            if errors:
+                messagebox.showerror(
+                    "Auto Converge",
+                    "\n".join(errors[:10]) + ("\n..." if len(errors) > 10 else ""),
+                )
+                return
+            if successes == 0:
+                break
+            entries = self._gather_parameter_entries(tab_key, header)
+            alpha_keys = [entry["alpha_key"] for entry in entries]
+            rms_value = self._compute_rms_statistic(tab_key, alpha_keys)
+            if rms_value is None:
+                break
+            if rms_value <= settings.target_rms:
+                self.set_status(
+                    f"Auto-converged {header} to RMS {rms_value:.4g} in {iteration} iteration(s)."
+                )
+                messagebox.showinfo(
+                    "Auto Converge",
+                    f"Reached RMS {rms_value:.4g} after {iteration} iteration(s).",
+                )
+                return
+            if prev_rms - rms_value < settings.min_improvement:
+                break
+            prev_rms = rms_value
+        if rms_value is not None:
+            messagebox.showinfo(
+                "Auto Converge",
+                f"Stopped after {iteration} iteration(s). Latest RMS: {rms_value:.4g} (target {settings.target_rms:.4g}).",
+            )
+
+    def _pairs_for_entries(self, tab_key: str, entries: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+        alpha_map = self.alpha_to_files.get(tab_key, {})
+        pairs: List[Tuple[str, str]] = []
+        for entry in entries:
+            display_name = entry.get("file_name") or alpha_map.get(entry["alpha_key"], "")
+            if not display_name:
                 continue
-            for alpha_text, stem in self.loaded_alpha_pairs:
-                alpha_key = self.normalize_alpha(alpha_text)
-                measurement_path = self._measurement_path_for_stem(stem, self.loaded_base_path)
-                if not measurement_path:
-                    errors.append(f"{stem}: measurement (.ROP/.EMU) not found")
-                    continue
-                block = self.parameter_blocks.get(tab_key, {}).get(alpha_key)
-                try:
-                    rop_data = read_material_file(measurement_path)
-                except Exception as exc:
-                    errors.append(f"{stem}: unable to read measurement data: {exc}")
-                    continue
-                for attempt in range(5):
-                    if tab_key == "EPS":
-                        controls = self._build_debye_controls(alpha_key)
-                        controls = self._adjust_controls_for_attempt(controls, attempt)
-                        result = fit_debye(rop_data, controls)
-                        report = generate_dbe_report(
-                            rop_data,
-                            controls,
-                            result,
-                            input_file=measurement_path,
-                            output_file=self.alpha_file_paths.get(tab_key, {}).get(alpha_key, measurement_path.with_suffix(".DBE")),
-                        )
-                    else:
-                        controls = self._build_double_lorentz_controls(alpha_key)
-                        controls = self._adjust_dl_controls_for_attempt(controls, attempt)
-                        result = fit_double_lorentz(rop_data, "mu", controls)
-                        report = generate_dlm_report(
-                            rop_data,
-                            "mu",
-                            controls,
-                            result,
-                            input_file=measurement_path,
-                            output_file=self.alpha_file_paths.get(tab_key, {}).get(alpha_key, measurement_path.with_suffix(".2LM")),
-                        )
-                    output_path = self.alpha_file_paths.get(tab_key, {}).get(alpha_key)
-                    if not output_path:
-                        extension = self.tab_extensions.get(tab_key) or state.config.file_extension
-                        output_path = self.resolve_stem(stem, self.loaded_base_path, extension)
-                        self.alpha_file_paths.setdefault(tab_key, {})[alpha_key] = output_path
-                    try:
-                        output_path.write_text(report)
-                    except OSError as exc:
-                        errors.append(f"{output_path.name}: unable to write report ({exc})")
-                        break
-                    if result.iflag == 0:
-                        successes += 1
-                        break
-                    if attempt == 4:
-                        errors.append(f"{stem}: solver did not converge after multiple attempts")
-        missing = self.populate_tables(self.loaded_alpha_pairs, self.loaded_base_path)
-        if missing:
-            errors.extend(f"{name}: missing after auto converge" for name in missing)
-        if self.loaded_lst_path:
-            self.load_lsf_data(self.loaded_lst_path)
-        self.update_plots()
-        self.update_summary_tables()
-        self.update_highlights()
-        self.update_polynomial_models()
-        for key in self.tabs:
-            self.refresh_ini_table(key)
+            pairs.append((entry["alpha_text"], display_name))
+        return pairs
+
+    def _blend_ini_values_toward_targets(self, entries: List[Dict[str, Any]], factor: float) -> bool:
+        factor = max(0.0, min(1.0, factor))
+        updated_blocks: Dict[Path, ParameterBlock] = {}
+        changed = False
+        for entry in entries:
+            block = entry["block"]
+            idx = entry["index"]
+            target_value = entry.get("lsf_value")
+            if target_value is None:
+                continue
+            current_text = block.values[idx]
+            mode = self._infer_control_mode(current_text)
+            current_numeric = self._try_parse_numeric(current_text)
+            if mode == "estimate":
+                mode = "negative"
+                current_magnitude = abs(target_value)
+            else:
+                current_magnitude = abs(current_numeric) if current_numeric is not None else abs(target_value)
+            target_magnitude = max(abs(target_value), 1e-9)
+            new_magnitude = current_magnitude + (target_magnitude - current_magnitude) * factor
+            new_magnitude = max(new_magnitude, 1e-9)
+            formatted = f"{new_magnitude:.6g}"
+            if mode == "negative":
+                formatted = f"-{formatted.lstrip('+').lstrip('-')}"
+            if formatted == current_text:
+                continue
+            block.values[idx] = formatted
+            updated_blocks[block.path] = block
+            changed = True
+        if not changed:
+            return False
+        for block in updated_blocks.values():
+            if not self.apply_ini_changes(block, block.values, reload_data=False):
+                return False
+        return True
+
+    def _compute_rms_statistic(self, tab_key: str, alpha_keys: List[str]) -> Optional[float]:
+        state = self.tabs.get(tab_key)
+        if not state:
+            return None
+        rms_index = state.column_index.get("RMS")
+        if rms_index is None:
+            return None
+        lookup = set(alpha_keys)
+        values: List[float] = []
+        for item in state.large_tree.get_children():
+            row = state.large_tree.item(item, "values")
+            if not row:
+                continue
+            alpha_key = self.normalize_alpha(row[0])
+            if alpha_key not in lookup:
+                continue
+            if rms_index >= len(row):
+                continue
+            numeric = self._try_parse_numeric(row[rms_index])
+            if numeric is not None:
+                values.append(numeric)
+        if not values:
+            return None
+        return max(values)
+
+    def _ensure_parameter_data(self, tab_key: str) -> bool:
+        blocks = self.parameter_blocks.get(tab_key, {})
+        if any(blocks.values()):
+            return True
+        errors: List[str] = []
+        successes = self.run_tab_fits(
+            tab_key,
+            silent=False,
+            error_list=errors,
+            reload=True,
+            selected_pairs=None,
+        )
         if successes:
-            self.set_status(f"Auto converge completed ({successes} fits updated).")
+            return True
         if errors:
             messagebox.showerror(
                 "Auto Converge",
                 "\n".join(errors[:10]) + ("\n..." if len(errors) > 10 else ""),
             )
+        else:
+            messagebox.showerror("Auto Converge", "Unable to generate parameter files for this tab.")
+        return False
 
     @staticmethod
     def _autosize_tree_columns(tree: ttk.Treeview, min_width: int = 80) -> None:
@@ -2488,6 +2603,53 @@ class MaterialGui:
             epsv=self._parse_float(self._value_for_keys(values, "MURV0")),
             sige=self._parse_float(self._value_for_keys(values, "SIGM0", "SIGE0")),
         )
+
+    def _gather_parameter_entries(self, tab_key: str, header: str) -> List[Dict[str, Any]]:
+        state = self.tabs.get(tab_key)
+        if not state:
+            return []
+        mapping_entry = state.config.ini_mapping.get(header)
+        if not mapping_entry:
+            return []
+        column_index = state.column_index.get(header)
+        stem_index = state.column_index.get(state.config.stem_header)
+        if column_index is None:
+            return []
+        entries: List[Dict[str, Any]] = []
+        for item in state.large_tree.get_children():
+            values = state.large_tree.item(item, "values")
+            if not values:
+                continue
+            alpha_text = values[0]
+            alpha_key = self.normalize_alpha(alpha_text)
+            block = self.parameter_blocks.get(tab_key, {}).get(alpha_key)
+            if not block:
+                continue
+            candidates = (mapping_entry,) if isinstance(mapping_entry, str) else tuple(mapping_entry)
+            header_name = next((name for name in candidates if name in block.headers), None)
+            if not header_name:
+                continue
+            try:
+                idx = block.headers.index(header_name)
+            except ValueError:
+                continue
+            file_name = ""
+            if stem_index is not None and stem_index < len(values):
+                file_name = values[stem_index]
+            lsf_value: Optional[float] = None
+            if column_index < len(values):
+                lsf_value = self._try_parse_numeric(values[column_index])
+            entries.append(
+                {
+                    "alpha_text": alpha_text,
+                    "alpha_key": alpha_key,
+                    "block": block,
+                    "index": idx,
+                    "lsf_value": lsf_value,
+                    "file_name": file_name,
+                }
+            )
+        return entries
 
     def _seed_monotonic_initial_guesses(self, tab_key: str, header: str) -> None:
         state = self.tabs[tab_key]
