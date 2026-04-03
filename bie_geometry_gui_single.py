@@ -245,6 +245,20 @@ def parse_number_list(text: str) -> List[float]:
     return [float(p) for p in parts]
 
 
+
+
+def project_curves(project: ProjectModel):
+    groups = []
+    by_name = {}
+    order = []
+    for idx, card in enumerate(project.geometry_cards):
+        if card.curve_name not in by_name:
+            by_name[card.curve_name] = {"name": card.curve_name, "rows": [idx], "card": card}
+            order.append(card.curve_name)
+        else:
+            by_name[card.curve_name]["rows"].append(idx)
+    return [by_name[name] for name in order]
+
 # ----------------------------
 # Table model
 # ----------------------------
