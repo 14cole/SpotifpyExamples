@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,6 +88,7 @@ class GeometryCard:
     icard: int
     ipn1: int
     ipn2: int
+    explicit_impedance_raw: str = ""
 
 
 @dataclass
@@ -115,44 +117,60 @@ def parse_geometry_file(path: Path) -> ProjectModel:
     cards: List[GeometryCard] = []
 
     with path.open("r", encoding="utf-8") as f:
+        pending_card: Optional[GeometryCard] = None
+
         for lineno, raw in enumerate(f, start=1):
-            line = raw.strip()
-            if not line:
+            line = raw.rstrip("\n")
+            stripped = line.strip()
+            if not stripped:
                 continue
 
-            if line.startswith("#"):
-                label = line[1:].strip() or "Unnamed"
+            if stripped.startswith("#"):
+                if pending_card is not None:
+                    cards.append(pending_card)
+                    pending_card = None
+                    saw_data = True
+                label = stripped[1:].strip() or "Unnamed"
                 if not saw_data and title == "Untitled":
                     title = label
                 else:
                     current_curve = label
                 continue
 
-            toks = line.split()
-            if len(toks) != 10:
-                raise ValueError(
-                    f"{path.name}:{lineno}: expected 10 fields, got {len(toks)} -> {line}"
-                )
+            toks = stripped.split()
+            if len(toks) == 10:
+                if pending_card is not None:
+                    cards.append(pending_card)
+                    saw_data = True
+                try:
+                    pending_card = GeometryCard(
+                        curve_name=current_curve,
+                        itype=int(toks[0]),
+                        n=int(toks[1]),
+                        xa=float(toks[2]),
+                        ya=float(toks[3]),
+                        xb=float(toks[4]),
+                        yb=float(toks[5]),
+                        ang=float(toks[6]),
+                        icard=int(toks[7]),
+                        ipn1=int(toks[8]),
+                        ipn2=int(toks[9]),
+                    )
+                except Exception as e:
+                    raise ValueError(f"{path.name}:{lineno}: parse error: {e}") from e
+            else:
+                if pending_card is None:
+                    raise ValueError(
+                        f"{path.name}:{lineno}: expected 10 geometry fields or an explicit impedance continuation"
+                    )
+                try:
+                    parse_explicit_impedance_line(stripped)
+                except Exception as e:
+                    raise ValueError(f"{path.name}:{lineno}: {e}") from e
+                pending_card.explicit_impedance_raw = stripped
 
-            try:
-                card = GeometryCard(
-                    curve_name=current_curve,
-                    itype=int(toks[0]),
-                    n=int(toks[1]),
-                    xa=float(toks[2]),
-                    ya=float(toks[3]),
-                    xb=float(toks[4]),
-                    yb=float(toks[5]),
-                    ang=float(toks[6]),
-                    icard=int(toks[7]),
-                    ipn1=int(toks[8]),
-                    ipn2=int(toks[9]),
-                )
-            except Exception as e:
-                raise ValueError(f"{path.name}:{lineno}: parse error: {e}") from e
-
-            cards.append(card)
-            saw_data = True
+        if pending_card is not None:
+            cards.append(pending_card)
 
     model = ProjectModel(title=title, geometry_cards=cards, geometry_path=path)
     return model
@@ -170,6 +188,8 @@ def save_geometry_file(project: ProjectModel, path: Path) -> None:
             f"{c.xa:.6f} {c.ya:.6f} {c.xb:.6f} {c.yb:.6f} {c.ang:.6f} "
             f"{c.icard:d} {c.ipn1:d} {c.ipn2:d}"
         )
+        if c.explicit_impedance_raw.strip():
+            lines.append(f"       {c.explicit_impedance_raw.strip()}")
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -211,6 +231,39 @@ def load_impedance_file(path: Path):
         raise ValueError(f"{path.name}: no usable rows")
     rows.sort(key=lambda x: x[0])
     return rows
+
+
+_EXPLICIT_IMPEDANCE_RE = re.compile(
+    r"""^\s*
+    (?P<flag>[-+]?\d+)
+    \s+\(
+        \s*(?P<z1r>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*,\s*
+        (?P<z1i>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*
+    \)
+    \s+\(
+        \s*(?P<z2r>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*,\s*
+        (?P<z2i>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*
+    \)
+    \s+(?P<tail>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)
+    \s*$""",
+    re.VERBOSE,
+)
+
+
+def parse_explicit_impedance_line(line: str):
+    m = _EXPLICIT_IMPEDANCE_RE.match(line)
+    if not m:
+        raise ValueError(
+            "Expected explicit impedance continuation like: 0 (377.0,0.0) (0.0,0.0) 0.0"
+        )
+    gd = m.groupdict()
+    return {
+        "flag": int(gd["flag"]),
+        "z_primary": complex(float(gd["z1r"]), float(gd["z1i"])),
+        "z_secondary": complex(float(gd["z2r"]), float(gd["z2i"])),
+        "tail": float(gd["tail"]),
+        "raw": line.strip(),
+    }
 
 
 def parse_number_list(text: str) -> List[float]:
@@ -344,6 +397,7 @@ class CardEditDialog(QDialog):
         self.icard = QLineEdit(str(card.icard))
         self.ipn1 = QLineEdit(str(card.ipn1))
         self.ipn2 = QLineEdit(str(card.ipn2))
+        self.explicit_impedance_raw = QLineEdit(card.explicit_impedance_raw)
 
         form = QFormLayout()
         form.addRow("Curve Name", self.curve_name)
@@ -357,6 +411,7 @@ class CardEditDialog(QDialog):
         form.addRow("ICARD", self.icard)
         form.addRow("IPN1", self.ipn1)
         form.addRow("IPN2", self.ipn2)
+        form.addRow("Explicit Impedance", self.explicit_impedance_raw)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -378,6 +433,10 @@ class CardEditDialog(QDialog):
         self.card.icard = int(self.icard.text())
         self.card.ipn1 = int(self.ipn1.text())
         self.card.ipn2 = int(self.ipn2.text())
+        raw = self.explicit_impedance_raw.text().strip()
+        if raw:
+            parse_explicit_impedance_line(raw)
+        self.card.explicit_impedance_raw = raw
 
 
 # ----------------------------
@@ -664,6 +723,7 @@ class MainWindow(QMainWindow):
                 icard=0,
                 ipn1=0,
                 ipn2=0,
+                explicit_impedance_raw="",
             )
         )
         self.table_model.reset_model()
@@ -721,6 +781,7 @@ class MainWindow(QMainWindow):
         itype_counts = {}
         region_ids = set()
         icards = set()
+        explicit_impedance_count = 0
 
         for c in self.project.geometry_cards:
             itype_counts[c.itype] = itype_counts.get(c.itype, 0) + 1
@@ -730,6 +791,8 @@ class MainWindow(QMainWindow):
                 region_ids.add(c.ipn2)
             if c.icard != 0:
                 icards.add(c.icard)
+            if c.explicit_impedance_raw.strip():
+                explicit_impedance_count += 1
 
         lines = [
             f"Title: {self.project.title}",
@@ -747,6 +810,7 @@ class MainWindow(QMainWindow):
         lines.append("")
         lines.append(f"Referenced region IDs: {sorted(region_ids) if region_ids else '[]'}")
         lines.append(f"Referenced impedance IDs: {sorted(icards) if icards else '[]'}")
+        lines.append(f"Cards with explicit inline impedance: {explicit_impedance_count}")
         self.summary_box.setPlainText("\n".join(lines))
 
     def refresh_all(self):
@@ -798,6 +862,11 @@ class MainWindow(QMainWindow):
                 errors.append(f"Row {i}: region IDs must be >= 0.")
             if c.icard < 0:
                 errors.append(f"Row {i}: ICARD must be >= 0.")
+            if c.explicit_impedance_raw.strip():
+                try:
+                    parse_explicit_impedance_line(c.explicit_impedance_raw)
+                except Exception as e:
+                    errors.append(f"Row {i}: bad explicit impedance line: {e}")
 
             if c.ipn1 != 0:
                 region_ids.add(c.ipn1)
@@ -821,7 +890,11 @@ class MainWindow(QMainWindow):
                     except Exception as e:
                         errors.append(f"Bad material file {p.name}: {e}")
 
-            for cid in sorted(icards):
+            external_icards = sorted(
+                cid for cid in icards
+                if any(c.icard == cid and not c.explicit_impedance_raw.strip() for c in self.project.geometry_cards)
+            )
+            for cid in external_icards:
                 p = base_dir / f"impedance.{cid}"
                 if not p.exists():
                     errors.append(f"Missing impedance file: {p.name}")
