@@ -88,7 +88,6 @@ class GeometryCard:
     icard: int
     ipn1: int
     ipn2: int
-    explicit_impedance_raw: str = ""
 
 
 @dataclass
@@ -117,64 +116,47 @@ def parse_geometry_file(path: Path) -> ProjectModel:
     cards: List[GeometryCard] = []
 
     with path.open("r", encoding="utf-8") as f:
-        pending_card: Optional[GeometryCard] = None
-
         for lineno, raw in enumerate(f, start=1):
-            line = raw.rstrip("\n")
-            stripped = line.strip()
-            if not stripped:
+            line = raw.strip()
+            if not line:
                 continue
 
-            if stripped.startswith("#"):
-                if pending_card is not None:
-                    cards.append(pending_card)
-                    pending_card = None
-                    saw_data = True
-                label = stripped[1:].strip() or "Unnamed"
+            if line.startswith("#"):
+                label = line[1:].strip() or "Unnamed"
                 if not saw_data and title == "Untitled":
                     title = label
                 else:
                     current_curve = label
                 continue
 
-            toks = stripped.split()
-            if len(toks) == 10:
-                if pending_card is not None:
-                    cards.append(pending_card)
-                    saw_data = True
-                try:
-                    pending_card = GeometryCard(
-                        curve_name=current_curve,
-                        itype=int(toks[0]),
-                        n=int(toks[1]),
-                        xa=float(toks[2]),
-                        ya=float(toks[3]),
-                        xb=float(toks[4]),
-                        yb=float(toks[5]),
-                        ang=float(toks[6]),
-                        icard=int(toks[7]),
-                        ipn1=int(toks[8]),
-                        ipn2=int(toks[9]),
-                    )
-                except Exception as e:
-                    raise ValueError(f"{path.name}:{lineno}: parse error: {e}") from e
-            else:
-                if pending_card is None:
-                    raise ValueError(
-                        f"{path.name}:{lineno}: expected 10 geometry fields or an explicit impedance continuation"
-                    )
-                try:
-                    parse_explicit_impedance_line(stripped)
-                except Exception as e:
-                    raise ValueError(f"{path.name}:{lineno}: {e}") from e
-                pending_card.explicit_impedance_raw = stripped
+            toks = line.split()
+            if len(toks) != 10:
+                raise ValueError(
+                    f"{path.name}:{lineno}: expected 10 fields, got {len(toks)} -> {line}"
+                )
 
-        if pending_card is not None:
-            cards.append(pending_card)
+            try:
+                card = GeometryCard(
+                    curve_name=current_curve,
+                    itype=int(toks[0]),
+                    n=int(toks[1]),
+                    xa=float(toks[2]),
+                    ya=float(toks[3]),
+                    xb=float(toks[4]),
+                    yb=float(toks[5]),
+                    ang=float(toks[6]),
+                    icard=int(toks[7]),
+                    ipn1=int(toks[8]),
+                    ipn2=int(toks[9]),
+                )
+            except Exception as e:
+                raise ValueError(f"{path.name}:{lineno}: parse error: {e}") from e
+
+            cards.append(card)
+            saw_data = True
 
     model = ProjectModel(title=title, geometry_cards=cards, geometry_path=path)
     return model
-
 
 def save_geometry_file(project: ProjectModel, path: Path) -> None:
     lines = [f"#{project.title}"]
@@ -188,11 +170,8 @@ def save_geometry_file(project: ProjectModel, path: Path) -> None:
             f"{c.xa:.6f} {c.ya:.6f} {c.xb:.6f} {c.yb:.6f} {c.ang:.6f} "
             f"{c.icard:d} {c.ipn1:d} {c.ipn2:d}"
         )
-        if c.explicit_impedance_raw.strip():
-            lines.append(f"       {c.explicit_impedance_raw.strip()}")
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
 
 def load_material_file(path: Path):
     rows = []
@@ -231,39 +210,6 @@ def load_impedance_file(path: Path):
         raise ValueError(f"{path.name}: no usable rows")
     rows.sort(key=lambda x: x[0])
     return rows
-
-
-_EXPLICIT_IMPEDANCE_RE = re.compile(
-    r"""^\s*
-    (?P<flag>[-+]?\d+)
-    \s+\(
-        \s*(?P<z1r>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*,\s*
-        (?P<z1i>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*
-    \)
-    \s+\(
-        \s*(?P<z2r>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*,\s*
-        (?P<z2i>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*
-    \)
-    \s+(?P<tail>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)
-    \s*$""",
-    re.VERBOSE,
-)
-
-
-def parse_explicit_impedance_line(line: str):
-    m = _EXPLICIT_IMPEDANCE_RE.match(line)
-    if not m:
-        raise ValueError(
-            "Expected explicit impedance continuation like: 0 (377.0,0.0) (0.0,0.0) 0.0"
-        )
-    gd = m.groupdict()
-    return {
-        "flag": int(gd["flag"]),
-        "z_primary": complex(float(gd["z1r"]), float(gd["z1i"])),
-        "z_secondary": complex(float(gd["z2r"]), float(gd["z2i"])),
-        "tail": float(gd["tail"]),
-        "raw": line.strip(),
-    }
 
 
 def parse_number_list(text: str) -> List[float]:
@@ -310,8 +256,23 @@ class GeometryTableModel(QAbstractTableModel):
         super().__init__()
         self.project = project
 
+    @staticmethod
+    def _itype_color(itype: int):
+        from PySide6.QtGui import QColor
+        mapping = {
+            1: QColor(255, 230, 204),  # orange tint
+            2: QColor(220, 245, 220),  # green tint
+            3: QColor(220, 232, 255),  # blue tint
+            4: QColor(230, 230, 230),  # gray tint
+            5: QColor(235, 235, 235),  # near white for black type
+        }
+        return mapping.get(itype, QColor(255, 255, 255))
+
+    def _groups(self):
+        return project_curves(self.project)
+
     def rowCount(self, parent=QModelIndex()):
-        return len(self.project.geometry_cards)
+        return len(self._groups())
 
     def columnCount(self, parent=QModelIndex()):
         return len(self.headers)
@@ -319,44 +280,59 @@ class GeometryTableModel(QAbstractTableModel):
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
-        card = self.project.geometry_cards[index.row()]
+        grp = self._groups()[index.row()]
+        card = grp["card"]
         col = index.column()
 
         if role in (Qt.DisplayRole, Qt.EditRole):
             values = [
-                card.curve_name,
+                grp["name"],
                 card.itype,
                 card.icard,
                 card.ipn1,
                 card.ipn2,
             ]
             return values[col]
+
+        if role == Qt.BackgroundRole:
+            return self._itype_color(card.itype)
+
         return None
 
     def setData(self, index, value, role=Qt.EditRole):
         if not index.isValid() or role != Qt.EditRole:
             return False
 
-        card = self.project.geometry_cards[index.row()]
-        col = index.column()
+        grp = self._groups()[index.row()]
+        rows = grp["rows"]
 
         try:
-            if col == 0:
-                card.curve_name = str(value).strip() or "Curve"
-            elif col == 1:
-                card.itype = int(value)
-            elif col == 2:
-                card.icard = int(value)
-            elif col == 3:
-                card.ipn1 = int(value)
-            elif col == 4:
-                card.ipn2 = int(value)
+            if index.column() == 0:
+                new_name = str(value).strip() or "Curve"
+                for r in rows:
+                    self.project.geometry_cards[r].curve_name = new_name
+            elif index.column() == 1:
+                new_val = int(value)
+                for r in rows:
+                    self.project.geometry_cards[r].itype = new_val
+            elif index.column() == 2:
+                new_val = int(value)
+                for r in rows:
+                    self.project.geometry_cards[r].icard = new_val
+            elif index.column() == 3:
+                new_val = int(value)
+                for r in rows:
+                    self.project.geometry_cards[r].ipn1 = new_val
+            elif index.column() == 4:
+                new_val = int(value)
+                for r in rows:
+                    self.project.geometry_cards[r].ipn2 = new_val
             else:
                 return False
         except Exception:
             return False
 
-        self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
+        self.layoutChanged.emit()
         return True
 
     def flags(self, index):
@@ -397,7 +373,6 @@ class CardEditDialog(QDialog):
         self.icard = QLineEdit(str(card.icard))
         self.ipn1 = QLineEdit(str(card.ipn1))
         self.ipn2 = QLineEdit(str(card.ipn2))
-        self.explicit_impedance_raw = QLineEdit(card.explicit_impedance_raw)
 
         form = QFormLayout()
         form.addRow("Curve Name", self.curve_name)
@@ -411,7 +386,6 @@ class CardEditDialog(QDialog):
         form.addRow("ICARD", self.icard)
         form.addRow("IPN1", self.ipn1)
         form.addRow("IPN2", self.ipn2)
-        form.addRow("Explicit Impedance", self.explicit_impedance_raw)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -433,10 +407,6 @@ class CardEditDialog(QDialog):
         self.card.icard = int(self.icard.text())
         self.card.ipn1 = int(self.ipn1.text())
         self.card.ipn2 = int(self.ipn2.text())
-        raw = self.explicit_impedance_raw.text().strip()
-        if raw:
-            parse_explicit_impedance_line(raw)
-        self.card.explicit_impedance_raw = raw
 
 
 # ----------------------------
@@ -449,15 +419,16 @@ class GeometryCanvas(FigureCanvas):
         self.ax = self.fig.add_subplot(111)
         super().__init__(self.fig)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.line_to_curve = {}
 
     @staticmethod
     def _itype_color(itype: int) -> str:
         mapping = {
-            1: "tab:orange",
-            2: "tab:blue",
-            3: "tab:green",
-            4: "tab:red",
-            5: "tab:purple",
+            1: "orange",
+            2: "green",
+            3: "blue",
+            4: "gray",
+            5: "black",
         }
         return mapping.get(itype, "black")
 
@@ -476,41 +447,56 @@ class GeometryCanvas(FigureCanvas):
     def draw_project(
         self,
         project: ProjectModel,
-        selected_rows: Optional[List[int]] = None,
+        selected_curve_names: Optional[List[str]] = None,
         show_normals: bool = False,
         show_labels: bool = False,
     ):
-        selected = set(selected_rows or [])
+        selected = set(selected_curve_names or [])
         self.ax.clear()
+        self.line_to_curve = {}
 
         xs = []
         ys = []
 
-        for i, card in enumerate(project.geometry_cards):
-            color = self._itype_color(card.itype)
-            lw = 3.0 if i in selected else 1.5
-            alpha = 1.0 if i in selected else 0.85
+        for grp in project_curves(project):
+            name = grp["name"]
+            rows = grp["rows"]
+            card0 = grp["card"]
+            color = self._itype_color(card0.itype)
+            is_selected = name in selected
+            lw = 3.0 if is_selected else 1.8
+            alpha = 1.0 if is_selected else 0.9
 
-            self.ax.plot([card.xa, card.xb], [card.ya, card.yb], color=color, lw=lw, alpha=alpha)
-            xs.extend([card.xa, card.xb])
-            ys.extend([card.ya, card.yb])
-
-            if show_normals:
-                xc = 0.5 * (card.xa + card.xb)
-                yc = 0.5 * (card.ya + card.yb)
-                nx, ny = self._normal(card)
-                L = math.hypot(card.xb - card.xa, card.yb - card.ya)
-                scale = 0.10 * L if L > 0 else 1.0
-                self.ax.arrow(
-                    xc, yc, nx * scale, ny * scale,
-                    width=0.0, head_width=max(scale * 0.25, 0.1), head_length=max(scale * 0.35, 0.15),
-                    length_includes_head=True, color=color, alpha=0.8
+            for row_idx in rows:
+                card = project.geometry_cards[row_idx]
+                (line,) = self.ax.plot(
+                    [card.xa, card.xb],
+                    [card.ya, card.yb],
+                    color=color,
+                    lw=lw,
+                    alpha=alpha,
+                    picker=6,
                 )
+                self.line_to_curve[line] = name
+                xs.extend([card.xa, card.xb])
+                ys.extend([card.ya, card.yb])
 
-            if show_labels:
-                xc = 0.5 * (card.xa + card.xb)
-                yc = 0.5 * (card.ya + card.yb)
-                self.ax.text(xc, yc, card.curve_name, fontsize=8)
+                if show_normals:
+                    xc = 0.5 * (card.xa + card.xb)
+                    yc = 0.5 * (card.ya + card.yb)
+                    nx, ny = self._normal(card)
+                    L = math.hypot(card.xb - card.xa, card.yb - card.ya)
+                    scale = 0.10 * L if L > 0 else 1.0
+                    self.ax.arrow(
+                        xc, yc, nx * scale, ny * scale,
+                        width=0.0, head_width=max(scale * 0.25, 0.1), head_length=max(scale * 0.35, 0.15),
+                        length_includes_head=True, color=color, alpha=0.8
+                    )
+
+            if show_labels and rows:
+                xc = sum(0.5 * (project.geometry_cards[r].xa + project.geometry_cards[r].xb) for r in rows) / len(rows)
+                yc = sum(0.5 * (project.geometry_cards[r].ya + project.geometry_cards[r].yb) for r in rows) / len(rows)
+                self.ax.text(xc, yc, name, fontsize=8)
 
         self.ax.set_title(project.title or "Geometry")
         self.ax.set_xlabel("X")
@@ -619,6 +605,7 @@ class MainWindow(QMainWindow):
         self.table.setModel(self.table_model)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.selectionModel().selectionChanged.connect(lambda *_: self.refresh_plot())
+        self.canvas.mpl_connect("pick_event", self.on_plot_pick)
         self.table.doubleClicked.connect(self.edit_selected_geometry)
         right_layout.addWidget(self.table)
 
@@ -723,7 +710,6 @@ class MainWindow(QMainWindow):
                 icard=0,
                 ipn1=0,
                 ipn2=0,
-                explicit_impedance_raw="",
             )
         )
         self.table_model.reset_model()
@@ -733,9 +719,9 @@ class MainWindow(QMainWindow):
         idxs = self.table.selectionModel().selectedRows()
         if not idxs:
             return
-        rows = sorted((i.row() for i in idxs), reverse=True)
-        for r in rows:
-            del self.project.geometry_cards[r]
+        groups = project_curves(self.project)
+        names_to_delete = {groups[i.row()]["name"] for i in idxs if 0 <= i.row() < len(groups)}
+        self.project.geometry_cards = [c for c in self.project.geometry_cards if c.curve_name not in names_to_delete]
         self.table_model.reset_model()
         self.refresh_all()
 
@@ -744,16 +730,58 @@ class MainWindow(QMainWindow):
         if not idxs:
             QMessageBox.information(self, "Edit Geometry", "Select one row first.")
             return
+        groups = project_curves(self.project)
         row = idxs[0].row()
-        card = self.project.geometry_cards[row]
+        grp = groups[row]
+        card = grp["card"]
         dlg = CardEditDialog(card, self)
         if dlg.exec() == QDialog.Accepted:
             try:
                 dlg.apply()
+                # propagate shared properties across the full curve
+                for r in grp["rows"]:
+                    c = self.project.geometry_cards[r]
+                    c.curve_name = card.curve_name
+                    c.itype = card.itype
+                    c.icard = card.icard
+                    c.ipn1 = card.ipn1
+                    c.ipn2 = card.ipn2
                 self.table_model.reset_model()
                 self.refresh_all()
             except Exception as e:
                 QMessageBox.critical(self, "Edit Error", str(e))
+
+
+    def curve_names_for_selected_rows(self) -> List[str]:
+        names = []
+        groups = project_curves(self.project)
+        for idx in self.table.selectionModel().selectedRows():
+            if 0 <= idx.row() < len(groups):
+                names.append(groups[idx.row()]["name"])
+        return names
+
+    def select_curve_in_table(self, curve_name: str):
+        groups = project_curves(self.project)
+        from PySide6.QtCore import QItemSelectionModel
+        self.table.clearSelection()
+        for i, grp in enumerate(groups):
+            if grp["name"] == curve_name:
+                model_index = self.table_model.index(i, 0)
+                self.table.selectionModel().select(
+                    model_index,
+                    QItemSelectionModel.Select | QItemSelectionModel.Rows
+                )
+                self.table.scrollTo(model_index)
+                break
+
+    def on_plot_pick(self, event):
+        artist = getattr(event, "artist", None)
+        if artist is None:
+            return
+        curve_name = self.canvas.line_to_curve.get(artist)
+        if curve_name:
+            self.select_curve_in_table(curve_name)
+            self.refresh_plot()
 
     # ---- refresh / validation ----
 
@@ -763,7 +791,7 @@ class MainWindow(QMainWindow):
     def refresh_plot(self):
         self.canvas.draw_project(
             self.project,
-            selected_rows=self.selected_rows(),
+            selected_curve_names=self.curve_names_for_selected_rows(),
             show_normals=self.chk_normals.isChecked(),
             show_labels=self.chk_labels.isChecked(),
         )
@@ -781,8 +809,6 @@ class MainWindow(QMainWindow):
         itype_counts = {}
         region_ids = set()
         icards = set()
-        explicit_impedance_count = 0
-
         for c in self.project.geometry_cards:
             itype_counts[c.itype] = itype_counts.get(c.itype, 0) + 1
             if c.ipn1 != 0:
@@ -791,8 +817,6 @@ class MainWindow(QMainWindow):
                 region_ids.add(c.ipn2)
             if c.icard != 0:
                 icards.add(c.icard)
-            if c.explicit_impedance_raw.strip():
-                explicit_impedance_count += 1
 
         lines = [
             f"Title: {self.project.title}",
@@ -810,7 +834,6 @@ class MainWindow(QMainWindow):
         lines.append("")
         lines.append(f"Referenced region IDs: {sorted(region_ids) if region_ids else '[]'}")
         lines.append(f"Referenced impedance IDs: {sorted(icards) if icards else '[]'}")
-        lines.append(f"Cards with explicit inline impedance: {explicit_impedance_count}")
         self.summary_box.setPlainText("\n".join(lines))
 
     def refresh_all(self):
@@ -862,11 +885,6 @@ class MainWindow(QMainWindow):
                 errors.append(f"Row {i}: region IDs must be >= 0.")
             if c.icard < 0:
                 errors.append(f"Row {i}: ICARD must be >= 0.")
-            if c.explicit_impedance_raw.strip():
-                try:
-                    parse_explicit_impedance_line(c.explicit_impedance_raw)
-                except Exception as e:
-                    errors.append(f"Row {i}: bad explicit impedance line: {e}")
 
             if c.ipn1 != 0:
                 region_ids.add(c.ipn1)
@@ -889,12 +907,7 @@ class MainWindow(QMainWindow):
                         load_material_file(p)
                     except Exception as e:
                         errors.append(f"Bad material file {p.name}: {e}")
-
-            external_icards = sorted(
-                cid for cid in icards
-                if any(c.icard == cid and not c.explicit_impedance_raw.strip() for c in self.project.geometry_cards)
-            )
-            for cid in external_icards:
+            for cid in sorted(icards):
                 p = base_dir / f"impedance.{cid}"
                 if not p.exists():
                     errors.append(f"Missing impedance file: {p.name}")
